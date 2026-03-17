@@ -97,9 +97,11 @@ SYNC_ARGS=(sync --python "$PYTHON_BIN")
 if [[ "$FROZEN" -eq 1 ]]; then
   SYNC_ARGS+=(--frozen)
 fi
-for extra in "${EXTRAS[@]}"; do
-  SYNC_ARGS+=(--extra "$extra")
-done
+if [[ "${#EXTRAS[@]}" -gt 0 ]]; then
+  for extra in "${EXTRAS[@]}"; do
+    SYNC_ARGS+=(--extra "$extra")
+  done
+fi
 
 echo "[uv-env] running: uv ${SYNC_ARGS[*]}"
 uv "${SYNC_ARGS[@]}"
