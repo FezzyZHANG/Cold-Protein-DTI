@@ -3,7 +3,7 @@ seed: 42
 mode: train
 
 data:
-  dataset_name: your_dataset
+  dataset_name: SCOPE_CP
   split_name: cp_easy
   train_path: data/train.csv
   val_path: data/val.csv
@@ -24,6 +24,7 @@ training:
   weight_decay: 1.0e-5
   amp: true
   num_workers: 4
+  early_stopping_patience: 7
   device: cuda
 
 output:
