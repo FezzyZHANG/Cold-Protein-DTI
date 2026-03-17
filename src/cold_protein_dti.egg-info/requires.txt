@@ -1,0 +1,16 @@
+numpy<3,>=1.24
+polars<2,>=1.0
+PyYAML<7,>=6
+
+[esm]
+fair-esm<3,>=2.0.0
+torch<2.7,>=2.1
+tqdm<5,>=4.66
+
+[train]
+scikit-learn<2,>=1.4
+torch<2.7,>=2.1
+
+[viz]
+matplotlib<4,>=3.7
+umap-learn<0.6,>=0.5

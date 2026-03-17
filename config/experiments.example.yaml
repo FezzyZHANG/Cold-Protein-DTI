@@ -1,42 +1,70 @@
-run_name: cp_easy_frozen_protein_baseline
+run_name: cp_easy_cnn_concat_s42
 seed: 42
-mode: train
 
 data:
-  dataset_name: SCOPE_CP
+  dataset_name: scope_dti
   split_name: cp_easy
-  train_path: data/train.csv
-  val_path: data/val.csv
-  test_path: data/test.csv
+  split_dir: data/splits/cp_easy_sub500000
+  raw_path: data/scope_dti_with_inchikey.parquet
+  max_smiles_length: 128
+  max_protein_length: 1024
 
 model:
-  drug_encoder: gcn
-  protein_encoder: cnn
-  protein_encoder_mode: frozen
-  fusion: ban
   hidden_dim: 256
   dropout: 0.1
+  drug_encoder:
+    name: gcn
+    embed_dim: 128
+    hidden_dim: 256
+    num_layers: 2
+    dropout: 0.1
+  protein_encoder:
+    name: cnn
+    mode: scratch
+    embed_dim: 128
+    hidden_dim: 256
+    kernel_sizes:
+      - 5
+      - 9
+      - 15
+    dropout: 0.1
+  fusion:
+    name: concat
+    hidden_dim: 256
+    dropout: 0.1
 
 training:
-  epochs: 30
+  epochs: 5
   batch_size: 128
-  lr: 1.0e-4
-  weight_decay: 1.0e-5
+  lr: 0.001
+  weight_decay: 0.00001
   amp: true
-  num_workers: 4
-  early_stopping_patience: 7
+  num_workers: 0
   device: cuda
+  early_stopping_patience: 3
+  resume: false
+  max_train_batches: null
+  max_eval_batches: null
 
 output:
   root_dir: results
   save_checkpoints: true
-  save_every_n_epochs: 5
+  save_every_n_epochs: 1
+  allow_rerun_suffix: true
 
 metrics:
   primary: auprc
+  threshold: 0.5
+  ks:
+    - 10
+    - 50
+    - 100
+  ef_fractions:
+    - 0.01
+    - 0.05
   extra:
     - auroc
-    - precision
-    - recall
+    - auprc
     - f1
-    - accuracy
+    - mcc
+

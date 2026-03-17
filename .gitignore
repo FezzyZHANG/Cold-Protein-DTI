@@ -15,6 +15,7 @@ __pycache__/
 venv/
 .env
 .env.*
+config/experiments/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -27,7 +28,14 @@ Thumbs.db
 outputs/
 checkpoints/
 runs/
+results/
+logs/
+data/splits/
+artifacts/ 
 self/
 figures/
 *.pt
 *.ckpt
+
+
+.github/

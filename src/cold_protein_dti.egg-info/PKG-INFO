@@ -1,0 +1,57 @@
+Metadata-Version: 2.4
+Name: cold-protein-dti
+Version: 0.1.0
+Summary: Utilities and experiment scaffolding for cold-protein DTI research.
+Requires-Python: <3.11,>=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy<3,>=1.24
+Requires-Dist: polars<2,>=1.0
+Requires-Dist: PyYAML<7,>=6
+Provides-Extra: train
+Requires-Dist: scikit-learn<2,>=1.4; extra == "train"
+Requires-Dist: torch<2.7,>=2.1; extra == "train"
+Provides-Extra: viz
+Requires-Dist: matplotlib<4,>=3.7; extra == "viz"
+Requires-Dist: umap-learn<0.6,>=0.5; extra == "viz"
+Provides-Extra: esm
+Requires-Dist: fair-esm<3,>=2.0.0; extra == "esm"
+Requires-Dist: torch<2.7,>=2.1; extra == "esm"
+Requires-Dist: tqdm<5,>=4.66; extra == "esm"
+
+# Runtime Topology Notes
+
+This project runs across three environments:
+
+1. Local Windows machine
+2. Remote cluster entry host: `hpc-zzy`
+3. Remote calculation node: `gpu01`
+
+## SSH / host layout
+
+- Both `hpc-zzy` and `gpu01` are already configured in local SSH config.
+- `gpu01` is reached through a proxy jump setup rather than treated like a normal internet-connected standalone machine.
+- Day-to-day workflow is:
+  - edit and manage the repo on the local Windows machine
+  - sync code to the remote side
+  - launch training or evaluation remotely on the cluster path
+
+## Package management
+
+- Use `uv` for package management.
+- Keep the environment workflow conservative and compatible with the existing remote setup.
+- Do not assume the remote runtime behaves like a modern internet-connected Ubuntu workstation.
+
+## Network constraints
+
+- `gpu01` does not have internet access.
+- The local Windows machine has a localhost proxy at `127.0.0.1:7890`.
+- The local machine and `hpc-zzy` are both in China, so external downloads should be treated carefully.
+- For model checkpoints or other external artifacts, prefer downloading on the local Windows machine through the local proxy and then syncing the files to the remote environment.
+- Do not rely on live downloads from `gpu01` during training or evaluation.
+
+## Practical implications
+
+- Avoid code paths that implicitly download checkpoints, tokenizers, datasets, or model assets at runtime.
+- Prefer explicit, pre-staged artifacts and documented paths.
+- Keep remote commands non-interactive and suitable for script or Makefile-based execution.
+- When adding environment setup instructions, prefer a `uv`-based workflow that can be prepared locally and applied remotely with minimal network assumptions.
