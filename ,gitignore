@@ -1,0 +1,31 @@
+*.pdf
+*.parquet
+*.csv
+*.xlsx
+
+# Python cache and tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments and local config
+.venv/
+venv/
+.env
+.env.*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Common experiment artifacts
+outputs/
+checkpoints/
+runs/
+*.pt
+*.ckpt
