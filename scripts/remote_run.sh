@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODE="${1:-}"
+EXP_PATH="${2:-}"
+
+if [[ -z "$MODE" || -z "$EXP_PATH" ]]; then
+  echo "Usage: bash scripts/remote_run.sh <train|eval> <config.yaml>"
+  exit 1
+fi
+
+if [[ ! -f "$EXP_PATH" ]]; then
+  echo "Config not found: $EXP_PATH"
+  exit 1
+fi
+
+# Optional environment activation.
+if [[ -n "${REMOTE_ACTIVATE:-}" ]]; then
+  # shellcheck disable=SC1090
+  eval "$REMOTE_ACTIVATE"
+fi
+
+echo "[INFO] Host: $(hostname)"
+echo "[INFO] Date: $(date)"
+echo "[INFO] Mode: $MODE"
+echo "[INFO] Config: $EXP_PATH"
+echo "[INFO] Python: $(which python || true)"
+python -V
+
+if command -v nvidia-smi >/dev/null 2>&1; then
+  echo "[INFO] nvidia-smi summary"
+  nvidia-smi || true
+fi
+
+case "$MODE" in
+  train)
+    python -m src.train --config "$EXP_PATH"
+    ;;
+  eval)
+    python -m src.eval --config "$EXP_PATH"
+    ;;
+  *)
+    echo "Unknown mode: $MODE"
+    exit 1
+    ;;
+esac
