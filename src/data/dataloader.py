@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 import polars as pl
+
+from src.data.mol_graph import default_graph_cache_path, load_graph_store
 
 
 def read_split_table(path: str | Path) -> pl.DataFrame:
@@ -28,6 +31,14 @@ def resolve_split_paths(data_cfg: dict[str, Any]) -> dict[str, Path]:
     }
 
 
+def resolve_graph_cache_path(data_cfg: dict[str, Any]) -> Path | None:
+    if data_cfg.get("graph_cache_path"):
+        return Path(data_cfg["graph_cache_path"])
+    if data_cfg.get("raw_path"):
+        return default_graph_cache_path(data_cfg["raw_path"])
+    return None
+
+
 def describe_splits(data_cfg: dict[str, Any]) -> dict[str, dict[str, float]]:
     summary: dict[str, dict[str, float]] = {}
     for split_name, path in resolve_split_paths(data_cfg).items():
@@ -41,6 +52,18 @@ def describe_splits(data_cfg: dict[str, Any]) -> dict[str, dict[str, float]]:
     return summary
 
 
+def describe_graph_cache(data_cfg: dict[str, Any]) -> dict[str, Any]:
+    cache_path = resolve_graph_cache_path(data_cfg)
+    if cache_path is None:
+        return {"path": None, "exists": False}
+    summary: dict[str, Any] = {"path": str(cache_path), "exists": cache_path.exists()}
+    if cache_path.exists():
+        manifest_path = cache_path.with_suffix(".json")
+        if manifest_path.exists():
+            summary["metadata"] = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return summary
+
+
 def build_dataloaders(config: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     from torch.utils.data import DataLoader
 
@@ -49,12 +72,19 @@ def build_dataloaders(config: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
     data_cfg = config["data"]
     training_cfg = config["training"]
     split_paths = resolve_split_paths(data_cfg)
+    graph_cache_path = resolve_graph_cache_path(data_cfg)
+    if graph_cache_path is None:
+        raise FileNotFoundError(
+            "A graph cache path is required for the GVP drug encoder. "
+            "Set `data.graph_cache_path` or `data.raw_path` and precalculate graphs with `python dataloader.py ...`."
+        )
+    graph_store, graph_metadata = load_graph_store(graph_cache_path)
     frames = {name: read_split_table(path) for name, path in split_paths.items()}
 
     datasets = {
         name: DTIDataset(
             frame=frame,
-            max_smiles_length=int(data_cfg["max_smiles_length"]),
+            graph_store=graph_store,
             max_protein_length=int(data_cfg["max_protein_length"]),
         )
         for name, frame in frames.items()
@@ -76,5 +106,10 @@ def build_dataloaders(config: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
     metadata = {
         "paths": {name: str(path) for name, path in split_paths.items()},
         "summary": describe_splits(data_cfg),
+        "graph_cache": {
+            "path": str(graph_cache_path),
+            "num_graphs": len(graph_store),
+            "metadata": graph_metadata,
+        },
     }
     return loaders, metadata
