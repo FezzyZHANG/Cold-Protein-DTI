@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-}"
-MODE="${MODE:-cp-easy}"
+MODE="${MODE:-cp-hard}"
 SUBSAMPLE_N="${SUBSAMPLE_N:-500000}"
 INPUT_PATH="${INPUT_PATH:-$PROJECT_ROOT/data/scope_dti_with_inchikey.parquet}"
 SKIP_EVAL="${SKIP_EVAL:-0}"
