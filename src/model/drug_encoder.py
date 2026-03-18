@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from torch import nn
-from torch_geometric.nn import global_add_pool
 from torch_geometric.utils import to_dense_batch
 
 from src.data.mol_graph import EDGE_SCALAR_DIM, EDGE_VECTOR_DIM, NODE_SCALAR_DIM, NODE_VECTOR_DIM
+from src.model.common import masked_mean
 from src.model.gvp import GVP, GVPConvLayer, GVPLayerNorm
 
 
@@ -60,7 +60,7 @@ class GVPDrugEncoder(nn.Module):
         node_state = self.output_norm(node_state)
         node_scalar, _ = self.output_proj(node_state)
         dense_nodes, mask = to_dense_batch(node_scalar, graph_batch.batch)
-        pooled = global_add_pool(node_scalar, graph_batch.batch)
+        pooled = masked_mean(dense_nodes, mask)
         return {
             "token_features": dense_nodes,
             "mask": mask,

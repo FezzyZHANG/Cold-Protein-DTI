@@ -68,6 +68,42 @@ def write_manifest(
     (output_dir / "split_manifest.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 
+def _filter_split_rows_by_graph_cache(
+    train_df: pl.DataFrame,
+    val_df: pl.DataFrame,
+    test_df: pl.DataFrame,
+    dropped_df: pl.DataFrame,
+    graph_store: dict[str, object],
+    graph_id_column: str,
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame, dict[str, int]]:
+    cached_ids = set(graph_store.keys())
+    split_frames = {"train": train_df, "val": val_df, "test": test_df}
+    kept_frames: dict[str, pl.DataFrame] = {}
+    newly_dropped: list[pl.DataFrame] = []
+    dropped_counts: dict[str, int] = {}
+
+    for split_name, frame in split_frames.items():
+        keep_mask = pl.col(graph_id_column).is_in(cached_ids)
+        kept_frame = frame.filter(keep_mask)
+        dropped_frame = frame.filter(~keep_mask)
+        kept_frames[split_name] = kept_frame
+        dropped_counts[split_name] = dropped_frame.height
+        if dropped_frame.height > 0:
+            newly_dropped.append(dropped_frame)
+
+    updated_dropped_df = dropped_df
+    if newly_dropped:
+        updated_dropped_df = pl.concat([dropped_df, *newly_dropped], how="vertical")
+
+    return (
+        kept_frames["train"],
+        kept_frames["val"],
+        kept_frames["test"],
+        updated_dropped_df,
+        dropped_counts,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Prepare DTI split parquet files from a raw table.")
     parser.add_argument("--input-path", required=True, help="Raw DTI table path (.parquet or .csv).")
@@ -132,25 +168,8 @@ def main() -> None:
         raise SystemExit(
             "Split preparation requires optional dependencies that are not installed. "
             "For `cp-hard`, install the ESM extra with `uv sync --extra esm` and make sure "
-            "the required pretrained assets are staged locally."
+            "the required pretrained assets are staged under `artifacts/pretrained`."
         ) from exc
-
-    train_df.write_parquet(output_dir / "train.parquet")
-    val_df.write_parquet(output_dir / "val.parquet")
-    test_df.write_parquet(output_dir / "test.parquet")
-
-    stats_df = pl.concat(
-        [
-            dti_set_stats(train_df).with_columns(pl.lit("train").alias("split")),
-            dti_set_stats(val_df).with_columns(pl.lit("val").alias("split")),
-            dti_set_stats(test_df).with_columns(pl.lit("test").alias("split")),
-        ],
-        how="vertical",
-    )
-    stats_df.write_csv(output_dir / "stats.csv")
-
-    if dropped_df.height > 0:
-        dropped_df.write_parquet(output_dir / "dropped.parquet")
 
     graph_cache_path: Path | None = None
     if args.build_graph_cache:
@@ -167,11 +186,29 @@ def main() -> None:
             progress_every=25000,
         )
         if failures:
-            example = failures[:5]
-            raise SystemExit(
-                "Graph precalculation failed for one or more filtered molecules. "
-                f"Examples: {json.dumps(example, indent=2)}"
+            failed_ids = [item.get(args.graph_id_column, item.get("inchi_key")) for item in failures]
+            train_df, val_df, test_df, dropped_df, dropped_counts = _filter_split_rows_by_graph_cache(
+                train_df=train_df,
+                val_df=val_df,
+                test_df=test_df,
+                dropped_df=dropped_df,
+                graph_store=graph_store,
+                graph_id_column=args.graph_id_column,
             )
+            print(
+                "[graph-cache] skipped compounds with failed graph construction: "
+                f"{len(failures)} compounds, "
+                f"dropped rows train={dropped_counts['train']}, "
+                f"val={dropped_counts['val']}, test={dropped_counts['test']}"
+            )
+            if train_df.height == 0 or val_df.height == 0 or test_df.height == 0:
+                example = failures[:5]
+                raise SystemExit(
+                    "Graph precalculation removed an entire split after filtering failed compounds. "
+                    f"Examples: {json.dumps(example, indent=2)}"
+                )
+        else:
+            failed_ids = []
         save_graph_store(
             graph_store=graph_store,
             output_path=graph_cache_path,
@@ -189,6 +226,8 @@ def main() -> None:
                     "smiles_column": args.smiles_column,
                     "distance_cutoff": args.distance_cutoff,
                     "num_graphs": len(graph_store),
+                    "num_failed_graphs": len(failures),
+                    "failed_graph_ids": failed_ids[:100],
                     "split_output_dir": str(output_dir),
                 },
                 indent=2,
@@ -196,6 +235,23 @@ def main() -> None:
             encoding="utf-8",
         )
         print(f"[graph-cache] wrote {len(graph_store)} graphs to {graph_cache_path}")
+
+    train_df.write_parquet(output_dir / "train.parquet")
+    val_df.write_parquet(output_dir / "val.parquet")
+    test_df.write_parquet(output_dir / "test.parquet")
+
+    stats_df = pl.concat(
+        [
+            dti_set_stats(train_df).with_columns(pl.lit("train").alias("split")),
+            dti_set_stats(val_df).with_columns(pl.lit("val").alias("split")),
+            dti_set_stats(test_df).with_columns(pl.lit("test").alias("split")),
+        ],
+        how="vertical",
+    )
+    stats_df.write_csv(output_dir / "stats.csv")
+
+    if dropped_df.height > 0:
+        dropped_df.write_parquet(output_dir / "dropped.parquet")
 
     write_manifest(
         output_dir=output_dir,
