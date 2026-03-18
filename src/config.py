@@ -359,10 +359,15 @@ def _normalize_data_config(data_cfg: dict[str, Any]) -> dict[str, Any]:
         normalized.setdefault("train_path", str(split_dir_path / "train.parquet"))
         normalized.setdefault("val_path", str(split_dir_path / "val.parquet"))
         normalized.setdefault("test_path", str(split_dir_path / "test.parquet"))
+        split_graph_cache_path = split_dir_path / "graph_cache.pt"
+        if split_graph_cache_path.exists():
+            normalized.setdefault("graph_cache_path", str(split_graph_cache_path))
 
     if not normalized.get("graph_cache_path") and normalized.get("raw_path"):
         raw_path = Path(normalized["raw_path"])
         normalized["graph_cache_path"] = str(raw_path.parent / "graphs" / f"{raw_path.stem}_graphs.pt")
+    elif not normalized.get("graph_cache_path") and split_dir:
+        normalized["graph_cache_path"] = str(Path(split_dir) / "graph_cache.pt")
 
     required_paths = ("train_path", "val_path", "test_path")
     if not all(normalized.get(key) for key in required_paths):

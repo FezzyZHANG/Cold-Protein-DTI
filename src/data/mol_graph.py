@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import polars as pl
 import torch
 
 
@@ -120,7 +121,7 @@ def build_molecule_3d(smiles: str, random_seed: int = 13) -> tuple[Any, np.ndarr
     mol = Chem.AddHs(mol)
     params = AllChem.ETKDGv3()
     params.randomSeed = int(random_seed)
-    params.maxAttempts = 10
+    # params.maxAttempts = 10; decraped
 
     status = AllChem.EmbedMolecule(mol, params)
     if status != 0:
@@ -211,6 +212,67 @@ def build_graph_from_smiles(
 def default_graph_cache_path(raw_path: str | Path) -> Path:
     raw = Path(raw_path)
     return raw.parent / "graphs" / f"{raw.stem}_graphs.pt"
+
+
+def default_split_graph_cache_path(split_dir: str | Path) -> Path:
+    split_path = Path(split_dir)
+    return split_path / "graph_cache.pt"
+
+
+def iter_unique_compounds(frame: Any, id_column: str, smiles_column: str) -> list[tuple[str, str]]:
+    pairs = frame.select([id_column, smiles_column]).unique()
+    conflicts = (
+        pairs.group_by(id_column)
+        .agg(pl.col(smiles_column).n_unique().alias("n_smiles"))
+        .filter(pl.col("n_smiles") > 1)
+    )
+    if conflicts.height > 0:
+        example_ids = conflicts.head(5).select(id_column).to_series().to_list()
+        print(
+            f"[graph-cache] WARNING: Found {conflicts.height} graph ids mapping to multiple SMILES strings. "
+            f"Keeping only the first SMILES for each id. Examples of conflicting ids: {example_ids}"
+        )
+        pairs = pairs.unique(subset=id_column, keep="first")
+
+    return list(
+        zip(
+            pairs[id_column].cast(pl.Utf8).to_list(),
+            pairs[smiles_column].cast(pl.Utf8).to_list(),
+        )
+    )
+
+
+def build_graph_store_from_table(
+    frame: Any,
+    id_column: str = "inchi_key",
+    smiles_column: str = "smiles",
+    distance_cutoff: float = DISTANCE_CUTOFF,
+    limit: int | None = None,
+    progress_every: int = 25000,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Build a graph store for the unique compounds referenced by a table."""
+    compounds = iter_unique_compounds(frame, id_column=id_column, smiles_column=smiles_column)
+    if limit is not None:
+        compounds = compounds[:limit]
+
+    graph_store: dict[str, Any] = {}
+    failures: list[dict[str, str]] = []
+    total = len(compounds)
+
+    for index, (graph_id, smiles) in enumerate(compounds, start=1):
+        try:
+            graph_store[graph_id] = build_graph_from_smiles(
+                smiles=smiles,
+                graph_id=graph_id,
+                distance_cutoff=float(distance_cutoff),
+            )
+        except Exception as exc:  # pragma: no cover - surfaced through caller manifest
+            failures.append({"inchi_key": graph_id, "smiles": smiles, "error": str(exc)})
+
+        if index == total or index % progress_every == 0:
+            print(f"[graph-cache] processed {index}/{total}")
+
+    return graph_store, failures
 
 
 def save_graph_store(

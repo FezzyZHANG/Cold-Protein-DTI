@@ -15,6 +15,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from split_utils import cold_protein_split, dti_set_stats, naive_random_split
+from src.data.mol_graph import (
+    build_graph_store_from_table,
+    default_split_graph_cache_path,
+    save_graph_store,
+)
 
 
 def read_table(path: Path) -> pl.DataFrame:
@@ -35,6 +40,7 @@ def write_manifest(
     val_df: pl.DataFrame,
     test_df: pl.DataFrame,
     dropped_df: pl.DataFrame,
+    graph_cache_path: Path | None = None,
 ) -> None:
     summary = {
         "input_path": str(input_path),
@@ -57,6 +63,7 @@ def write_manifest(
             "n_proteins": int(test_df.select("target_uniprot_id").n_unique()),
         },
         "dropped_rows": dropped_df.height,
+        "graph_cache_path": str(graph_cache_path) if graph_cache_path is not None else None,
     }
     (output_dir / "split_manifest.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
@@ -76,6 +83,20 @@ def main() -> None:
     parser.add_argument("--max-extreme-ratio", type=float, default=10.0)
     parser.add_argument("--filter-max-iters", type=int, default=20)
     parser.add_argument("--cp-hard-verbose", action="store_true")
+    parser.add_argument(
+        "--build-graph-cache",
+        action="store_true",
+        help="Build a split-local molecule graph cache from the filtered split union.",
+    )
+    parser.add_argument(
+        "--graph-cache-path",
+        default=None,
+        help="Optional output path for the split-local graph cache. Defaults to <output-dir>/graph_cache.pt.",
+    )
+    parser.add_argument("--graph-id-column", default="inchi_key")
+    parser.add_argument("--smiles-column", default="smiles")
+    parser.add_argument("--distance-cutoff", type=float, default=4.5)
+    parser.add_argument("--graph-limit", type=int, default=None)
     args = parser.parse_args()
 
     input_path = Path(args.input_path)
@@ -131,6 +152,51 @@ def main() -> None:
     if dropped_df.height > 0:
         dropped_df.write_parquet(output_dir / "dropped.parquet")
 
+    graph_cache_path: Path | None = None
+    if args.build_graph_cache:
+        graph_cache_path = (
+            Path(args.graph_cache_path) if args.graph_cache_path else default_split_graph_cache_path(output_dir)
+        )
+        filtered_df = pl.concat([train_df, val_df, test_df], how="vertical")
+        graph_store, failures = build_graph_store_from_table(
+            frame=filtered_df,
+            id_column=args.graph_id_column,
+            smiles_column=args.smiles_column,
+            distance_cutoff=float(args.distance_cutoff),
+            limit=args.graph_limit,
+            progress_every=25000,
+        )
+        if failures:
+            example = failures[:5]
+            raise SystemExit(
+                "Graph precalculation failed for one or more filtered molecules. "
+                f"Examples: {json.dumps(example, indent=2)}"
+            )
+        save_graph_store(
+            graph_store=graph_store,
+            output_path=graph_cache_path,
+            source_path=input_path,
+            distance_cutoff=float(args.distance_cutoff),
+            graph_id_column=args.graph_id_column,
+            failures=failures,
+        )
+        graph_cache_path.with_suffix(".json").write_text(
+            json.dumps(
+                {
+                    "source_path": str(input_path),
+                    "output_path": str(graph_cache_path),
+                    "graph_id_column": args.graph_id_column,
+                    "smiles_column": args.smiles_column,
+                    "distance_cutoff": args.distance_cutoff,
+                    "num_graphs": len(graph_store),
+                    "split_output_dir": str(output_dir),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"[graph-cache] wrote {len(graph_store)} graphs to {graph_cache_path}")
+
     write_manifest(
         output_dir=output_dir,
         input_path=input_path,
@@ -141,6 +207,7 @@ def main() -> None:
         val_df=val_df,
         test_df=test_df,
         dropped_df=dropped_df,
+        graph_cache_path=graph_cache_path,
     )
 
     print(f"[split] wrote split files to: {output_dir}")

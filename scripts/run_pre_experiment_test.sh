@@ -32,7 +32,7 @@ resolve_python() {
 
 PYTHON_BIN="$(resolve_python)"
 SPLIT_DIR="$PROJECT_ROOT/data/splits/${MODE}_sub${SUBSAMPLE_N}"
-GRAPH_CACHE_PATH="$(dirname "$INPUT_PATH")/graphs/$(basename "${INPUT_PATH%.*}")_graphs.pt"
+GRAPH_CACHE_PATH="$SPLIT_DIR/graph_cache.pt"
 RUN_NAME="preexperiment_${MODE//-/_}_cnn_concat_s42_$(date +%Y%m%d_%H%M%S)"
 CONFIG_PATH="$PROJECT_ROOT/config/experiments/preexperiment_cnn_smoke.yaml"
 
@@ -51,7 +51,8 @@ echo "[pretest] preparing split files in $SPLIT_DIR"
   --output-dir "$SPLIT_DIR" \
   --mode "$MODE" \
   --seed 42 \
-  --subsample-n "$SUBSAMPLE_N"
+  --subsample-n "$SUBSAMPLE_N" \
+  --build-graph-cache
 
 DRY_RUN=0
 if ! "$PYTHON_BIN" -c "import torch" >/dev/null 2>&1; then
@@ -61,7 +62,7 @@ fi
 
 if [[ ! -f "$GRAPH_CACHE_PATH" ]]; then
   echo "[pretest] graph cache not found at $GRAPH_CACHE_PATH"
-  echo "[pretest] build it first with: $PYTHON_BIN dataloader.py $INPUT_PATH"
+  echo "[pretest] build it first with: $PYTHON_BIN scripts/prepare_dti_splits.py --input-path $INPUT_PATH --output-dir $SPLIT_DIR --mode $MODE --seed 42 --subsample-n $SUBSAMPLE_N --build-graph-cache"
   if [[ "$DRY_RUN" -eq 0 ]]; then
     DRY_RUN=1
     echo "[pretest] falling back to --dry-run validation until the graph cache is available."

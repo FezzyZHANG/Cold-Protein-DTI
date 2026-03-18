@@ -8,7 +8,7 @@ from typing import Any
 
 import polars as pl
 
-from src.data.mol_graph import default_graph_cache_path, load_graph_store
+from src.data.mol_graph import default_graph_cache_path, default_split_graph_cache_path, load_graph_store
 
 
 def read_split_table(path: str | Path) -> pl.DataFrame:
@@ -34,8 +34,14 @@ def resolve_split_paths(data_cfg: dict[str, Any]) -> dict[str, Path]:
 def resolve_graph_cache_path(data_cfg: dict[str, Any]) -> Path | None:
     if data_cfg.get("graph_cache_path"):
         return Path(data_cfg["graph_cache_path"])
+    if data_cfg.get("split_dir"):
+        split_cache_path = default_split_graph_cache_path(data_cfg["split_dir"])
+        if split_cache_path.exists():
+            return split_cache_path
     if data_cfg.get("raw_path"):
         return default_graph_cache_path(data_cfg["raw_path"])
+    if data_cfg.get("split_dir"):
+        return default_split_graph_cache_path(data_cfg["split_dir"])
     return None
 
 
@@ -76,7 +82,7 @@ def build_dataloaders(config: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
     if graph_cache_path is None:
         raise FileNotFoundError(
             "A graph cache path is required for the GVP drug encoder. "
-            "Set `data.graph_cache_path` or `data.raw_path` and precalculate graphs with `python dataloader.py ...`."
+            "Set `data.graph_cache_path`, provide `data.raw_path`, or build a split-local cache under `data.split_dir`."
         )
     graph_store, graph_metadata = load_graph_store(graph_cache_path)
     frames = {name: read_split_table(path) for name, path in split_paths.items()}

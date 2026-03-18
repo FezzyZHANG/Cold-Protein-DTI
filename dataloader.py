@@ -9,7 +9,7 @@ from pathlib import Path
 
 import polars as pl
 
-from src.data.mol_graph import build_graph_from_smiles, default_graph_cache_path, save_graph_store
+from src.data.mol_graph import build_graph_store_from_table, default_graph_cache_path, save_graph_store
 
 
 def read_table(path: Path) -> pl.DataFrame:
@@ -18,23 +18,6 @@ def read_table(path: Path) -> pl.DataFrame:
     if path.suffix.lower() == ".csv":
         return pl.read_csv(path)
     raise ValueError(f"Unsupported input file format: {path.suffix}")
-
-
-def iter_unique_compounds(frame: pl.DataFrame, id_column: str, smiles_column: str) -> list[tuple[str, str]]:
-    pairs = frame.select([id_column, smiles_column]).unique()
-    conflicts = (
-        pairs.group_by(id_column)
-        .agg(pl.col(smiles_column).n_unique().alias("n_smiles"))
-        .filter(pl.col("n_smiles") > 1)
-    )
-    if conflicts.height > 0:
-        example_ids = conflicts.head(5).select(id_column).to_series().to_list()
-        raise ValueError(
-            "Each graph id must map to exactly one SMILES string. "
-            f"Found {conflicts.height} conflicting ids, for example: {example_ids}"
-        )
-
-    return list(zip(pairs[id_column].cast(pl.Utf8).to_list(), pairs[smiles_column].cast(pl.Utf8).to_list()))
 
 
 def main() -> None:
@@ -54,26 +37,14 @@ def main() -> None:
     manifest_path = output_path.with_suffix(".json")
 
     frame = read_table(input_path)
-    compounds = iter_unique_compounds(frame, id_column=args.id_column, smiles_column=args.smiles_column)
-    if args.limit is not None:
-        compounds = compounds[: args.limit]
-
-    graph_store: dict[str, object] = {}
-    failures: list[dict[str, str]] = []
-
-    total = len(compounds)
-    for index, (graph_id, smiles) in enumerate(compounds, start=1):
-        try:
-            graph_store[graph_id] = build_graph_from_smiles(
-                smiles=smiles,
-                graph_id=graph_id,
-                distance_cutoff=float(args.distance_cutoff),
-            )
-        except Exception as exc:  # pragma: no cover - surfaced through manifest
-            failures.append({"inchi_key": graph_id, "smiles": smiles, "error": str(exc)})
-
-        if index == total or index % 250 == 0:
-            print(f"[graph-cache] processed {index}/{total}")
+    graph_store, failures = build_graph_store_from_table(
+        frame=frame,
+        id_column=args.id_column,
+        smiles_column=args.smiles_column,
+        distance_cutoff=float(args.distance_cutoff),
+        limit=args.limit,
+        progress_every=25000,
+    )
 
     if failures:
         example = failures[:5]
