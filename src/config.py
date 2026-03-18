@@ -284,16 +284,18 @@ def apply_overrides(config: dict[str, Any], overrides: list[str]) -> dict[str, A
 def _normalize_model_config(model_cfg: dict[str, Any]) -> dict[str, Any]:
     normalized = deepcopy(model_cfg)
 
-    drug_cfg = normalized.get("drug_encoder", "gcn")
+    drug_cfg = normalized.get("drug_encoder", "gvp")
     if isinstance(drug_cfg, str):
         drug_cfg = {"name": drug_cfg}
-    drug_cfg.setdefault("name", "gcn")
-    drug_cfg.setdefault("embed_dim", 128)
-    drug_cfg.setdefault("hidden_dim", 256)
-    drug_cfg.setdefault("num_layers", 2)
+    drug_cfg.setdefault("name", "gvp")
+    drug_cfg.setdefault("node_hidden_scalar", normalized.get("hidden_dim", 256))
+    drug_cfg.setdefault("node_hidden_vector", 16)
+    drug_cfg.setdefault("edge_hidden_scalar", 64)
+    drug_cfg.setdefault("edge_hidden_vector", 4)
+    drug_cfg.setdefault("num_layers", 3)
     drug_cfg.setdefault("dropout", normalized.get("dropout", 0.1))
-    if drug_cfg["name"] != "gcn":
-        raise ConfigError("Only the conservative `gcn` drug encoder scaffold is currently supported.")
+    if drug_cfg["name"] != "gvp":
+        raise ConfigError("Only the conservative `gvp` drug encoder is currently supported.")
 
     protein_cfg = normalized.get("protein_encoder", "cnn")
     if isinstance(protein_cfg, str):
@@ -346,10 +348,10 @@ def _normalize_data_config(data_cfg: dict[str, Any]) -> dict[str, Any]:
     normalized = deepcopy(data_cfg)
     normalized.setdefault("dataset_name", "scope_dti")
     normalized.setdefault("split_name", "cp_easy")
-    normalized.setdefault("max_smiles_length", 128)
     normalized.setdefault("max_protein_length", 1024)
     normalized.setdefault("file_format", "parquet")
     normalized.setdefault("raw_path", None)
+    normalized.setdefault("graph_id_column", "inchi_key")
 
     split_dir = normalized.get("split_dir")
     if split_dir:
@@ -357,6 +359,10 @@ def _normalize_data_config(data_cfg: dict[str, Any]) -> dict[str, Any]:
         normalized.setdefault("train_path", str(split_dir_path / "train.parquet"))
         normalized.setdefault("val_path", str(split_dir_path / "val.parquet"))
         normalized.setdefault("test_path", str(split_dir_path / "test.parquet"))
+
+    if not normalized.get("graph_cache_path") and normalized.get("raw_path"):
+        raw_path = Path(normalized["raw_path"])
+        normalized["graph_cache_path"] = str(raw_path.parent / "graphs" / f"{raw_path.stem}_graphs.pt")
 
     required_paths = ("train_path", "val_path", "test_path")
     if not all(normalized.get(key) for key in required_paths):
@@ -446,4 +452,3 @@ def load_and_resolve_config(
     if overrides:
         loaded = apply_overrides(loaded, overrides)
     return resolve_config(loaded, config_path=config_path, cli_mode=mode, cli_seed=seed)
-

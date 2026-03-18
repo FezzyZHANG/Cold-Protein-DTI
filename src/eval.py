@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from src.config import ConfigError, load_and_resolve_config, save_config
-from src.data.dataloader import build_dataloaders, describe_splits
+from src.data.dataloader import build_dataloaders, describe_graph_cache, describe_splits
 from src.metrics import build_metrics_payload, sigmoid
 from src.utils import (
     build_logger,
@@ -55,9 +55,11 @@ def run_evaluation(config: dict[str, Any], checkpoint_path: str | None, dry_run:
 
     logger = build_logger(run_dir / "eval.log", logger_name=f"eval:{config['run_name']}")
     split_summary = describe_splits(config["data"])
+    graph_cache_summary = describe_graph_cache(config["data"])
     resolved_checkpoint = _resolve_checkpoint_path(run_dir, checkpoint_path)
     logger.info("Evaluating checkpoint: %s", resolved_checkpoint)
     logger.info("Split summary: %s", round_nested(split_summary))
+    logger.info("Graph cache: %s", round_nested(graph_cache_summary))
 
     if dry_run:
         payload = {
@@ -66,6 +68,7 @@ def run_evaluation(config: dict[str, Any], checkpoint_path: str | None, dry_run:
             "run_name": config["run_name"],
             "checkpoint": str(resolved_checkpoint),
             "split_summary": round_nested(split_summary),
+            "graph_cache": round_nested(graph_cache_summary),
             "environment": environment_snapshot(),
         }
         write_json(payload, run_dir / "eval_metrics.json")

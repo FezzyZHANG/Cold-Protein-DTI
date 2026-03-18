@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 
 from src.config import ConfigError, load_and_resolve_config, save_config
-from src.data.dataloader import build_dataloaders, describe_splits
+from src.data.dataloader import build_dataloaders, describe_graph_cache, describe_splits
 from src.metrics import build_metrics_payload, sigmoid
 from src.utils import (
     build_logger,
@@ -132,9 +132,11 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
     save_config(config, run_dir / "config.resolved.yaml")
 
     split_summary = describe_splits(config["data"])
+    graph_cache_summary = describe_graph_cache(config["data"])
     logger.info("Resolved config from %s", config["config_path"])
     logger.info("Run directory: %s", run_dir)
     logger.info("Split summary: %s", round_nested(split_summary))
+    logger.info("Graph cache: %s", round_nested(graph_cache_summary))
 
     if dry_run:
         payload = {
@@ -142,6 +144,7 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
             "mode": config["mode"],
             "run_name": config["run_name"],
             "split_summary": round_nested(split_summary),
+            "graph_cache": round_nested(graph_cache_summary),
             "environment": environment_snapshot(),
         }
         write_json(payload, run_dir / "metrics.json")
@@ -329,4 +332,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

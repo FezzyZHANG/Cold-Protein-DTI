@@ -36,6 +36,8 @@ if (-not $InputPath) {
 
 $Python = Resolve-Python -RequestedPython $Python
 $SplitDir = Join-Path $ProjectRoot ("data\splits\{0}_sub{1}" -f $Mode, $SubsampleN)
+$GraphCacheDir = Join-Path (Split-Path -Parent $InputPath) "graphs"
+$GraphCachePath = Join-Path $GraphCacheDir ("{0}_graphs.pt" -f [System.IO.Path]::GetFileNameWithoutExtension($InputPath))
 $RunName = ("preexperiment_{0}_cnn_concat_s42_{1}" -f $Mode.Replace("-", "_"), (Get-Date -Format "yyyyMMdd_HHmmss"))
 $ConfigPath = Join-Path $ProjectRoot "config\experiments\preexperiment_cnn_smoke.yaml"
 
@@ -64,11 +66,21 @@ try {
         Write-Host "[pretest] torch is not installed. Falling back to --dry-run validation."
     }
 
+    if (-not (Test-Path $GraphCachePath)) {
+        Write-Host "[pretest] graph cache not found at $GraphCachePath"
+        Write-Host "[pretest] build it first with: $Python dataloader.py $InputPath"
+        if (-not $DryRun) {
+            $DryRun = $true
+            Write-Host "[pretest] falling back to --dry-run validation until the graph cache is available."
+        }
+    }
+
     $CommonArgs = @(
         "--config", $ConfigPath,
         "--set", "run_name=$RunName",
         "--set", "data.split_name=$Mode",
         "--set", "data.split_dir=$SplitDir",
+        "--set", "data.graph_cache_path=$GraphCachePath",
         "--set", "output.allow_rerun_suffix=false"
     )
 

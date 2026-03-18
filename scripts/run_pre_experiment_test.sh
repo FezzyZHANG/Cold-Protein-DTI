@@ -32,6 +32,7 @@ resolve_python() {
 
 PYTHON_BIN="$(resolve_python)"
 SPLIT_DIR="$PROJECT_ROOT/data/splits/${MODE}_sub${SUBSAMPLE_N}"
+GRAPH_CACHE_PATH="$(dirname "$INPUT_PATH")/graphs/$(basename "${INPUT_PATH%.*}")_graphs.pt"
 RUN_NAME="preexperiment_${MODE//-/_}_cnn_concat_s42_$(date +%Y%m%d_%H%M%S)"
 CONFIG_PATH="$PROJECT_ROOT/config/experiments/preexperiment_cnn_smoke.yaml"
 
@@ -58,11 +59,21 @@ if ! "$PYTHON_BIN" -c "import torch" >/dev/null 2>&1; then
   echo "[pretest] torch is not installed. Falling back to --dry-run validation."
 fi
 
+if [[ ! -f "$GRAPH_CACHE_PATH" ]]; then
+  echo "[pretest] graph cache not found at $GRAPH_CACHE_PATH"
+  echo "[pretest] build it first with: $PYTHON_BIN dataloader.py $INPUT_PATH"
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    DRY_RUN=1
+    echo "[pretest] falling back to --dry-run validation until the graph cache is available."
+  fi
+fi
+
 COMMON_ARGS=(
   --config "$CONFIG_PATH"
   --set "run_name=$RUN_NAME"
   --set "data.split_name=$MODE"
   --set "data.split_dir=$SPLIT_DIR"
+  --set "data.graph_cache_path=$GRAPH_CACHE_PATH"
   --set "output.allow_rerun_suffix=false"
 )
 
