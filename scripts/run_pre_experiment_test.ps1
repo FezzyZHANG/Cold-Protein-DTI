@@ -1,6 +1,6 @@
 param(
     [string]$Python = "",
-    [string]$Mode = "cp-easy",
+    [string]$Mode = "cp-hard",
     [int]$SubsampleN = 500000,
     [string]$InputPath = "",
     [switch]$SkipEval
@@ -43,9 +43,9 @@ $ConfigPath = Join-Path $ProjectRoot "config\experiments\preexperiment_cnn_smoke
 Push-Location $ProjectRoot
 try {
     if ($Mode -eq "cp-hard") {
-        & $Python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('torch') and importlib.util.find_spec('esm') else 1)" *> $null
+        & $Python -c "import importlib.util, sys; has_torch = importlib.util.find_spec('torch') is not None; has_transformers = importlib.util.find_spec('transformers') is not None; sys.exit(0 if has_torch and has_transformers else 1)" *> $null
         if ($LASTEXITCODE -ne 0) {
-            throw "cp-hard pre-experiment preparation requires both torch and fair-esm. Run `uv sync --extra esm` first."
+            throw "cp-hard pre-experiment preparation requires torch and transformers. Run `uv sync --extra esm` first."
         }
     }
 

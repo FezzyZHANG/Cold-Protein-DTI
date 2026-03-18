@@ -39,8 +39,8 @@ CONFIG_PATH="$PROJECT_ROOT/config/experiments/preexperiment_cnn_smoke.yaml"
 cd "$PROJECT_ROOT"
 
 if [[ "$MODE" == "cp-hard" ]]; then
-  if ! "$PYTHON_BIN" -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('torch') and importlib.util.find_spec('esm') else 1)" >/dev/null 2>&1; then
-    echo "[pretest] cp-hard pre-experiment preparation requires both torch and fair-esm. Run 'uv sync --extra esm' first." >&2
+  if ! "$PYTHON_BIN" -c "import importlib.util, sys; has_torch = importlib.util.find_spec('torch') is not None; has_transformers = importlib.util.find_spec('transformers') is not None; sys.exit(0 if has_torch and has_transformers else 1)" >/dev/null 2>&1; then
+    echo "[pretest] cp-hard pre-experiment preparation requires torch and transformers. Run 'uv sync --extra esm' first." >&2
     exit 1
   fi
 fi

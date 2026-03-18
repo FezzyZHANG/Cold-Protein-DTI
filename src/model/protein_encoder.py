@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from pathlib import Path
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 
-from src.model.drug_encoder import masked_mean
+from src.model.common import masked_mean
+from src.model.esm_support import load_esm_backbone
 
 
 class CNNProteinEncoder(nn.Module):
@@ -62,68 +62,108 @@ class ESMProteinEncoder(nn.Module):
         max_input_length: int,
         repr_layer: int | None = None,
         local_checkpoint_path: str | None = None,
+        freeze_n_layers: int = 0,
     ) -> None:
         super().__init__()
 
-        try:
-            import esm  # type: ignore
-        except ImportError as exc:
-            raise RuntimeError(
-                "The ESM protein encoder requires the optional `fair-esm` dependency. "
-                "Install it with `uv sync --extra esm` and stage the checkpoint locally."
-            ) from exc
-
-        if local_checkpoint_path:
-            checkpoint = Path(local_checkpoint_path)
-            if not checkpoint.exists():
-                raise FileNotFoundError(f"Local ESM checkpoint not found: {checkpoint}")
-            backbone, alphabet = esm.pretrained.load_model_and_alphabet_local(str(checkpoint))
-        else:
-            load_fn = getattr(esm.pretrained, model_name, None)
-            if load_fn is None:
-                raise ValueError(f"Unknown ESM model name: {model_name}")
-            backbone, alphabet = load_fn()
-
-        self.backbone = backbone
-        self.alphabet = alphabet
-        self.batch_converter = alphabet.get_batch_converter()
+        loaded_backbone = load_esm_backbone(model_name=model_name, local_checkpoint_path=local_checkpoint_path)
+        self.backbone = loaded_backbone.backbone
+        self.tokenizer = loaded_backbone.tokenizer
+        self.backend = loaded_backbone.backend
         self.mode = mode
         self.max_input_length = int(max_input_length)
-        self.repr_layer = int(repr_layer) if repr_layer is not None else int(getattr(backbone, "num_layers", 33))
-        backbone_dim = getattr(backbone, "embed_dim", None)
-        if backbone_dim is None and hasattr(backbone, "embed_tokens"):
-            backbone_dim = int(backbone.embed_tokens.embedding_dim)
-        if backbone_dim is None:
-            raise RuntimeError("Unable to determine the ESM embedding dimension from the loaded checkpoint.")
+        self.num_layers = int(loaded_backbone.num_layers)
+        self.repr_layer = int(repr_layer) if repr_layer is not None else self.num_layers
+        if self.repr_layer < 0 or self.repr_layer > self.num_layers:
+            raise ValueError(
+                f"repr_layer must be between 0 and {self.num_layers} for {model_name}. "
+                f"Received {self.repr_layer}."
+            )
+        self.freeze_n_layers = int(freeze_n_layers)
+        if self.freeze_n_layers < 0:
+            raise ValueError(f"freeze_n_layers must be >= 0. Received {self.freeze_n_layers}.")
+        if self.freeze_n_layers > self.num_layers:
+            raise ValueError(
+                f"freeze_n_layers cannot exceed the number of ESM layers ({self.num_layers}). "
+                f"Received {self.freeze_n_layers}."
+            )
+        self.special_token_ids = {
+            int(token_id)
+            for token_id in getattr(self.tokenizer, "all_special_ids", [])
+            if token_id is not None
+        }
 
-        self.output_proj = nn.Linear(int(backbone_dim), hidden_dim)
+        self.output_proj = nn.Linear(int(loaded_backbone.hidden_size), hidden_dim)
         self.dropout = nn.Dropout(dropout)
         self.output_dim = hidden_dim
+        self._modules_kept_in_eval: list[nn.Module] = []
 
         if self.mode == "frozen":
-            for parameter in self.backbone.parameters():
-                parameter.requires_grad = False
-            self.backbone.eval()
+            self._freeze_module(self.backbone)
+            self._modules_kept_in_eval.append(self.backbone)
+        elif self.freeze_n_layers > 0:
+            for layer in self._get_encoder_layers()[: self.freeze_n_layers]:
+                self._freeze_module(layer)
+                self._modules_kept_in_eval.append(layer)
+
+    @staticmethod
+    def _freeze_module(module: nn.Module) -> None:
+        for parameter in module.parameters():
+            parameter.requires_grad = False
+        module.eval()
+
+    def _get_encoder_layers(self) -> list[nn.Module]:
+        encoder = getattr(self.backbone, "encoder", None)
+        layers = getattr(encoder, "layer", None)
+        if layers is None:
+            raise RuntimeError("Unable to locate ESM encoder layers for partial freezing.")
+        return list(layers)
+
+    def train(self, mode: bool = True) -> "ESMProteinEncoder":
+        super().train(mode)
+        for module in self._modules_kept_in_eval:
+            module.eval()
+        return self
+
+    def _forward_huggingface(self, sequences: list[str], device: torch.device, context: nullcontext | torch.no_grad) -> tuple[torch.Tensor, torch.Tensor]:
+        encoded = self.tokenizer(
+            sequences,
+            add_special_tokens=True,
+            padding=True,
+            truncation=True,
+            max_length=self.max_input_length + 2,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        input_ids = encoded["input_ids"].to(device)
+        attention_mask = encoded["attention_mask"].to(device)
+        use_hidden_states = self.repr_layer != self.num_layers
+
+        with context:
+            outputs = self.backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=use_hidden_states,
+                return_dict=True,
+            )
+            if use_hidden_states:
+                token_features = outputs.hidden_states[self.repr_layer]
+            else:
+                token_features = outputs.last_hidden_state
+
+        mask = attention_mask.to(dtype=torch.bool)
+        for token_id in self.special_token_ids:
+            mask &= input_ids.ne(token_id)
+        return token_features, mask
 
     def forward(self, batch: dict[str, torch.Tensor | list[str]]) -> dict[str, torch.Tensor]:
         sequences = [sequence[: self.max_input_length] for sequence in batch["protein_sequences"]]
-        entries = [(str(index), sequence) for index, sequence in enumerate(sequences)]
-        _, _, tokens = self.batch_converter(entries)
         device = next(self.parameters()).device
-        tokens = tokens.to(device)
 
         context = torch.no_grad() if self.mode == "frozen" else nullcontext()
-        with context:
-            outputs = self.backbone(tokens, repr_layers=[self.repr_layer], return_contacts=False)
-            token_features = outputs["representations"][self.repr_layer]
+        token_features, mask = self._forward_huggingface(sequences, device, context)
 
         token_features = self.dropout(self.output_proj(token_features))
-        mask = tokens.ne(self.alphabet.padding_idx)
-        mask[:, 0] = False
-        lengths = mask.sum(dim=1)
-        eos_positions = (lengths - 1).clamp_min(0)
-        mask[torch.arange(mask.shape[0], device=device), eos_positions] = False
-
         token_features = token_features * mask.unsqueeze(-1)
         pooled = masked_mean(token_features, mask)
         return {
@@ -131,4 +171,3 @@ class ESMProteinEncoder(nn.Module):
             "mask": mask,
             "pooled": pooled,
         }
-

@@ -46,13 +46,6 @@ def main() -> None:
         progress_every=25000,
     )
 
-    if failures:
-        example = failures[:5]
-        raise SystemExit(
-            "Graph precalculation failed for one or more molecules. "
-            f"Examples: {json.dumps(example, indent=2)}"
-        )
-
     save_graph_store(
         graph_store=graph_store,
         output_path=output_path,
@@ -70,11 +63,18 @@ def main() -> None:
                 "smiles_column": args.smiles_column,
                 "distance_cutoff": args.distance_cutoff,
                 "num_graphs": len(graph_store),
+                "num_failed_graphs": len(failures),
+                "failed_graph_ids": [item.get(args.id_column, item.get("inchi_key")) for item in failures[:100]],
             },
             indent=2,
         ),
         encoding="utf-8",
     )
+    if failures:
+        print(
+            "[graph-cache] skipped compounds with failed graph construction: "
+            f"{len(failures)} compounds. Examples: {json.dumps(failures[:5], indent=2)}"
+        )
     print(f"[graph-cache] wrote {len(graph_store)} graphs to {output_path}")
 
 

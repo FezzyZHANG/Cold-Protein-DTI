@@ -62,6 +62,7 @@ def build_model(config: dict[str, object]) -> DTIModel:
             repr_layer=protein_cfg["repr_layer"],
             local_checkpoint_path=protein_cfg["local_checkpoint_path"],
             max_input_length=int(protein_cfg["max_input_length"]),
+            freeze_n_layers=int(protein_cfg["freeze_n_layers"]),
         )
 
     fusion_input_dim = int(model_cfg["hidden_dim"])

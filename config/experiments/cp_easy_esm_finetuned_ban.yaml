@@ -26,8 +26,9 @@ model:
     hidden_dim: 256
     dropout: 0.1
     model_name: esm2_t33_650M_UR50D
-    local_checkpoint_path: artifacts/pretrained/esm/esm2_t33_650M_UR50D.pt
+    local_checkpoint_path: artifacts/pretrained/esm2_t33_650M_UR50D
     repr_layer: null
+    freeze_n_layers: 0
     max_input_length: 1022
   fusion:
     name: ban

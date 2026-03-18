@@ -3,8 +3,8 @@ seed: 42
 
 data:
   dataset_name: scope_dti
-  split_name: cp_easy
-  split_dir: data/splits/cp_easy_sub500000
+  split_name: cp_hard
+  split_dir: data/splits/cp_hard_sub500000
   raw_path: data/scope_dti_with_inchikey.parquet
   graph_cache_path: data/graphs/scope_dti_with_inchikey_graphs.pt
   max_protein_length: 1024
@@ -36,7 +36,7 @@ model:
     dropout: 0.1
 
 training:
-  epochs: 1
+  epochs: 5
   batch_size: 64
   lr: 0.001
   weight_decay: 0.00001

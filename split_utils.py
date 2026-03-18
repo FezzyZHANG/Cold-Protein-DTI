@@ -552,21 +552,17 @@ def build_esm2_embedding_table(
     if pairs.filter(pl.col("sequence").str.len_chars() == 0).height > 0:
         raise ValueError("Empty sequence values found.")
 
-    # Lazy import to avoid hard dependency for users who only need splitting.
     try:
         torch = importlib.import_module("torch")
-        esm = importlib.import_module("esm")
+        from src.model.esm_support import load_esm_backbone
     except ImportError as e:
         raise ImportError(
-            "ESM-2 embedding requires `torch` and `esm` packages. "
-            "Please install them in your environment."
+            "ESM-2 embedding requires `torch` plus the optional ESM dependencies. "
+            "Install them with `uv sync --extra esm`."
         ) from e
 
-    load_fn = getattr(esm.pretrained, model_name, None)
-    if load_fn is None:
-        raise ValueError(f"Unknown ESM-2 model: {model_name}")
-
-    model, alphabet = load_fn()
+    loaded_backbone = load_esm_backbone(model_name=model_name)
+    model = loaded_backbone.backbone
     model.eval()
 
     if device is None:
@@ -574,9 +570,18 @@ def build_esm2_embedding_table(
     model = model.to(device)
 
     if repr_layer is None:
-        repr_layer = int(getattr(model, "num_layers", 33))
+        repr_layer = int(loaded_backbone.num_layers)
+    repr_layer = int(repr_layer)
+    if repr_layer < 0 or repr_layer > int(loaded_backbone.num_layers):
+        raise ValueError(
+            f"repr_layer must be between 0 and {loaded_backbone.num_layers} for {model_name}. "
+            f"Received {repr_layer}."
+        )
 
-    batch_converter = alphabet.get_batch_converter()
+    tokenizer = loaded_backbone.tokenizer
+    special_token_ids = set()
+    if tokenizer is not None:
+        special_token_ids = {int(token_id) for token_id in tokenizer.all_special_ids if token_id is not None}
 
     rows: list[dict[str, Any]] = []
     ids = pairs["target_uniprot_id"].to_list()
@@ -596,18 +601,38 @@ def build_esm2_embedding_table(
         end = min(start + batch_size, len(ids))
         batch_data = [(ids[i], seqs[i]) for i in range(start, end)]
 
-        _, _, batch_tokens = batch_converter(batch_data)
-        batch_tokens = batch_tokens.to(device)
-        batch_lens = (batch_tokens != alphabet.padding_idx).sum(1)
+        batch_sequences = [sequence for _, sequence in batch_data]
+        encoded = tokenizer(
+            batch_sequences,
+            add_special_tokens=True,
+            padding=True,
+            truncation=True,
+            max_length=MAX_SEQ_LEN,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        batch_tokens = encoded["input_ids"].to(device)
+        attention_mask = encoded["attention_mask"].to(device)
+        use_hidden_states = repr_layer != int(loaded_backbone.num_layers)
 
         with torch.no_grad():
-            out = model(batch_tokens, repr_layers=[repr_layer], return_contacts=False)
-            token_reps = out["representations"][repr_layer]
+            out = model(
+                input_ids=batch_tokens,
+                attention_mask=attention_mask,
+                output_hidden_states=use_hidden_states,
+                return_dict=True,
+            )
+            if use_hidden_states:
+                token_reps = out.hidden_states[repr_layer]
+            else:
+                token_reps = out.last_hidden_state
+
+        residue_mask = attention_mask.to(dtype=torch.bool)
+        for token_id in special_token_ids:
+            residue_mask &= batch_tokens.ne(token_id)
 
         for i, (pid, seq) in enumerate(batch_data):
-            seq_len = int(batch_lens[i].item())
-            # Exclude BOS/EOS tokens.
-            residue_reps = token_reps[i, 1:seq_len - 1]
+            residue_reps = token_reps[i][residue_mask[i]]
             emb = residue_reps.mean(0)
             if normalize:
                 emb = torch.nn.functional.normalize(emb, p=2, dim=0)

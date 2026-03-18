@@ -12,13 +12,25 @@ import urllib.request
 
 MODEL_MANIFEST = {
     "esm2_t12_35M_UR50D": {
-        "url": "https://dl.fbaipublicfiles.com/fair-esm/models/esm2_t12_35M_UR50D.pt",
-        "filename": "esm2_t12_35M_UR50D.pt",
+        "base_url": "https://huggingface.co/facebook/esm2_t12_35M_UR50D/resolve/main",
+        "files": [
+            "config.json",
+            "tokenizer_config.json",
+            "vocab.txt",
+            "README.md",
+            "model.safetensors",
+        ],
         "description": "Small ESM2 checkpoint for quick validation runs.",
     },
     "esm2_t33_650M_UR50D": {
-        "url": "https://dl.fbaipublicfiles.com/fair-esm/models/esm2_t33_650M_UR50D.pt",
-        "filename": "esm2_t33_650M_UR50D.pt",
+        "base_url": "https://huggingface.co/facebook/esm2_t33_650M_UR50D/resolve/main",
+        "files": [
+            "config.json",
+            "tokenizer_config.json",
+            "vocab.txt",
+            "README.md",
+            "model.safetensors",
+        ],
         "description": "Recommended ESM2 checkpoint for the cold-protein experiment scaffold.",
     },
 }
@@ -61,14 +73,14 @@ def download_file(url: str, destination: Path, proxy: str | None, force: bool) -
     print()
 
 
-def write_metadata(output_path: Path, model_name: str, url: str) -> None:
+def write_metadata(output_dir: Path, model_name: str, source_urls: list[str]) -> None:
     metadata = {
         "model_name": model_name,
-        "path": str(output_path),
-        "source_url": url,
+        "path": str(output_dir),
+        "source_urls": source_urls,
         "downloaded_at": datetime.now().isoformat(timespec="seconds"),
     }
-    output_path.with_suffix(".json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    (output_dir / "download.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
 def main() -> None:
@@ -79,7 +91,7 @@ def main() -> None:
         default=None,
         help="Model key to download. Repeat to download multiple entries.",
     )
-    parser.add_argument("--output-dir", default="artifacts/pretrained/esm")
+    parser.add_argument("--output-dir", default="artifacts/pretrained")
     parser.add_argument("--proxy", default=None, help="Optional HTTP/HTTPS proxy, e.g. http://127.0.0.1:7890")
     parser.add_argument("--force", action="store_true", help="Overwrite an existing local file.")
     parser.add_argument("--show-models", action="store_true", help="Print available manifest entries and exit.")
@@ -88,7 +100,7 @@ def main() -> None:
     if args.show_models:
         for name, info in MODEL_MANIFEST.items():
             print(f"{name}: {info['description']}")
-            print(f"  {info['url']}")
+            print(f"  {info['base_url']}")
         return
 
     models = args.model or ["esm2_t33_650M_UR50D"]
@@ -100,15 +112,18 @@ def main() -> None:
             raise SystemExit(f"Unknown model '{model_name}'. Available choices: {available}")
 
         info = MODEL_MANIFEST[model_name]
-        output_path = output_dir / info["filename"]
+        model_output_dir = output_dir / model_name
+        source_urls = [f"{info['base_url']}/{filename}" for filename in info["files"]]
         print(f"[download] model={model_name}")
-        print(f"[download] source={info['url']}")
-        print(f"[download] target={output_path}")
-        download_file(info["url"], output_path, proxy=args.proxy, force=bool(args.force))
-        write_metadata(output_path, model_name=model_name, url=info["url"])
-        print(f"[download] completed: {output_path}")
+        print(f"[download] target={model_output_dir}")
+        for filename, source_url in zip(info["files"], source_urls):
+            output_path = model_output_dir / filename
+            print(f"[download] source={source_url}")
+            print(f"[download] file={output_path}")
+            download_file(source_url, output_path, proxy=args.proxy, force=bool(args.force))
+        write_metadata(model_output_dir, model_name=model_name, source_urls=source_urls)
+        print(f"[download] completed: {model_output_dir}")
 
 
 if __name__ == "__main__":
     main()
-

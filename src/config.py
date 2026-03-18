@@ -316,6 +316,7 @@ def _normalize_model_config(model_cfg: dict[str, Any]) -> dict[str, Any]:
     protein_cfg.setdefault("local_checkpoint_path", None)
     protein_cfg.setdefault("repr_layer", None)
     protein_cfg.setdefault("max_input_length", 1024)
+    protein_cfg.setdefault("freeze_n_layers", 0)
 
     if protein_cfg["name"] not in {"cnn", "esm"}:
         raise ConfigError("Protein encoder must be one of: cnn, esm.")
@@ -325,6 +326,15 @@ def _normalize_model_config(model_cfg: dict[str, Any]) -> dict[str, Any]:
 
     if protein_cfg["name"] == "esm" and protein_cfg["mode"] not in {"frozen", "finetuned"}:
         raise ConfigError("The ESM protein encoder supports `mode: frozen` or `mode: finetuned`.")
+
+    if protein_cfg["repr_layer"] is not None:
+        protein_cfg["repr_layer"] = int(protein_cfg["repr_layer"])
+        if protein_cfg["repr_layer"] < 0:
+            raise ConfigError("model.protein_encoder.repr_layer must be >= 0 when provided.")
+
+    protein_cfg["freeze_n_layers"] = int(protein_cfg["freeze_n_layers"])
+    if protein_cfg["freeze_n_layers"] < 0:
+        raise ConfigError("model.protein_encoder.freeze_n_layers must be >= 0.")
 
     fusion_cfg = normalized.get("fusion", "concat")
     if isinstance(fusion_cfg, str):
