@@ -15,7 +15,6 @@ __pycache__/
 venv/
 .env
 .env.*
-config/experiments/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -31,7 +30,8 @@ runs/
 results/
 logs/
 data/splits/
-artifacts/ 
+data/graphs/
+artifacts/
 self/
 figures/
 *.pt

@@ -12,8 +12,10 @@ dependencies = [
 
 [project.optional-dependencies]
 train = [
+    "rdkit>=2024.3,<2026",
     "scikit-learn>=1.4,<2",
     "torch>=2.1,<2.7",
+    "torch-geometric>=2.6,<3",
 ]
 viz = [
     "matplotlib>=3.7,<4",

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from torch import nn
 
-from src.data.dataset import AMINO_ACID_VOCAB, SMILES_VOCAB
-from src.model.drug_encoder import GCNDrugEncoder
+from src.data.dataset import AMINO_ACID_VOCAB
+from src.model.drug_encoder import GVPDrugEncoder
 from src.model.fusion import BANFusion, ConcatFusion
 from src.model.protein_encoder import CNNProteinEncoder, ESMProteinEncoder
 
@@ -36,10 +36,11 @@ def build_model(config: dict[str, object]) -> DTIModel:
     protein_cfg = model_cfg["protein_encoder"]
     fusion_cfg = model_cfg["fusion"]
 
-    drug_encoder = GCNDrugEncoder(
-        vocab_size=len(SMILES_VOCAB) + 2,
-        embed_dim=int(drug_cfg["embed_dim"]),
-        hidden_dim=int(drug_cfg["hidden_dim"]),
+    drug_encoder = GVPDrugEncoder(
+        node_hidden_scalar=int(drug_cfg["node_hidden_scalar"]),
+        node_hidden_vector=int(drug_cfg["node_hidden_vector"]),
+        edge_hidden_scalar=int(drug_cfg["edge_hidden_scalar"]),
+        edge_hidden_vector=int(drug_cfg["edge_hidden_vector"]),
         num_layers=int(drug_cfg["num_layers"]),
         dropout=float(drug_cfg["dropout"]),
     )

@@ -1,68 +1,68 @@
-"""Drug encoder scaffold using a simple chain-graph GCN over tokenized SMILES."""
+"""PyG-based drug encoder using geometric vector perceptron message passing."""
 
 from __future__ import annotations
 
-import torch
 from torch import nn
-import torch.nn.functional as F
+from torch_geometric.nn import global_add_pool
+from torch_geometric.utils import to_dense_batch
+
+from src.data.mol_graph import EDGE_SCALAR_DIM, EDGE_VECTOR_DIM, NODE_SCALAR_DIM, NODE_VECTOR_DIM
+from src.model.gvp import GVP, GVPConvLayer, GVPLayerNorm
 
 
-def masked_mean(features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    mask_float = mask.unsqueeze(-1).to(features.dtype)
-    denom = mask_float.sum(dim=1).clamp_min(1.0)
-    return (features * mask_float).sum(dim=1) / denom
+class GVPDrugEncoder(nn.Module):
+    """Encode precalculated molecular graphs with a compact GVP stack."""
 
-
-class ChainGraphConv(nn.Module):
-    """A conservative chain-neighbor message passing block for scaffold experiments."""
-
-    def __init__(self, hidden_dim: int) -> None:
+    def __init__(
+        self,
+        node_hidden_scalar: int,
+        node_hidden_vector: int,
+        edge_hidden_scalar: int,
+        edge_hidden_vector: int,
+        num_layers: int,
+        dropout: float,
+    ) -> None:
         super().__init__()
-        self.self_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.neighbor_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.norm = nn.LayerNorm(hidden_dim)
+        self.node_input = GVP(
+            in_dims=(NODE_SCALAR_DIM, NODE_VECTOR_DIM),
+            out_dims=(node_hidden_scalar, node_hidden_vector),
+        )
+        self.edge_input = GVP(
+            in_dims=(EDGE_SCALAR_DIM, EDGE_VECTOR_DIM),
+            out_dims=(edge_hidden_scalar, edge_hidden_vector),
+        )
+        self.layers = nn.ModuleList(
+            [
+                GVPConvLayer(
+                    node_dims=(node_hidden_scalar, node_hidden_vector),
+                    edge_dims=(edge_hidden_scalar, edge_hidden_vector),
+                    drop_rate=dropout,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.output_norm = GVPLayerNorm((node_hidden_scalar, node_hidden_vector))
+        self.output_proj = GVP(
+            in_dims=(node_hidden_scalar, node_hidden_vector),
+            out_dims=(node_hidden_scalar, 0),
+            activations=(None, None),
+        )
+        self.output_dim = node_hidden_scalar
 
-    def forward(self, node_features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        left = F.pad(node_features[:, :-1, :], (0, 0, 1, 0))
-        right = F.pad(node_features[:, 1:, :], (0, 0, 0, 1))
-        left_mask = F.pad(mask[:, :-1], (1, 0))
-        right_mask = F.pad(mask[:, 1:], (0, 1))
-
-        degree = left_mask.to(node_features.dtype) + right_mask.to(node_features.dtype)
-        neighbor_sum = left * left_mask.unsqueeze(-1) + right * right_mask.unsqueeze(-1)
-        neighbor_mean = neighbor_sum / degree.unsqueeze(-1).clamp_min(1.0)
-
-        updated = self.self_proj(node_features) + self.neighbor_proj(neighbor_mean)
-        updated = F.gelu(self.norm(updated))
-        return updated * mask.unsqueeze(-1)
-
-
-class GCNDrugEncoder(nn.Module):
-    """Token-level scaffold drug encoder with chain-graph message passing."""
-
-    def __init__(self, vocab_size: int, embed_dim: int, hidden_dim: int, num_layers: int, dropout: float) -> None:
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.input_proj = nn.Linear(embed_dim, hidden_dim)
-        self.layers = nn.ModuleList([ChainGraphConv(hidden_dim) for _ in range(num_layers)])
-        self.dropout = nn.Dropout(dropout)
-        self.output_dim = hidden_dim
-
-    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        token_ids = batch["smiles_tokens"]
-        mask = batch["smiles_mask"]
-
-        token_features = self.embedding(token_ids)
-        token_features = self.dropout(self.input_proj(token_features))
-        token_features = token_features * mask.unsqueeze(-1)
+    def forward(self, batch: dict[str, object]) -> dict[str, object]:
+        graph_batch = batch["drug_graph_batch"]
+        node_state = self.node_input((graph_batch.node_s.float(), graph_batch.node_v.float()))
+        edge_state = self.edge_input((graph_batch.edge_s.float(), graph_batch.edge_v.float()))
 
         for layer in self.layers:
-            token_features = layer(token_features, mask)
+            node_state = layer(node_state=node_state, edge_index=graph_batch.edge_index, edge_state=edge_state)
 
-        pooled = masked_mean(token_features, mask)
+        node_state = self.output_norm(node_state)
+        node_scalar, _ = self.output_proj(node_state)
+        dense_nodes, mask = to_dense_batch(node_scalar, graph_batch.batch)
+        pooled = global_add_pool(node_scalar, graph_batch.batch)
         return {
-            "token_features": token_features,
+            "token_features": dense_nodes,
             "mask": mask,
             "pooled": pooled,
         }
-
