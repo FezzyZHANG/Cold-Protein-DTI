@@ -63,6 +63,8 @@ metrics:
   ef_fractions:
     - 0.01
   extra:
+    - precision
+    - recall
     - auroc
     - auprc
     - f1

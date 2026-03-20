@@ -65,6 +65,8 @@ metrics:
     - 0.01
     - 0.05
   extra:
+    - precision
+    - recall
     - auroc
     - auprc
     - f1

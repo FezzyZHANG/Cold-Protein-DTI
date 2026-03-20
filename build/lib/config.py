@@ -396,7 +396,7 @@ def _normalize_metrics_config(metrics_cfg: dict[str, Any]) -> dict[str, Any]:
     normalized = deepcopy(metrics_cfg)
     normalized.setdefault("primary", "auprc")
     normalized.setdefault("threshold", 0.5)
-    normalized.setdefault("extra", ["auroc", "f1", "mcc"])
+    normalized.setdefault("extra", ["precision", "recall", "auroc", "f1", "mcc"])
     normalized.setdefault("ks", [10, 50, 100])
     normalized.setdefault("ef_fractions", [0.01, 0.05])
     return normalized
@@ -446,4 +446,3 @@ def load_and_resolve_config(
     if overrides:
         loaded = apply_overrides(loaded, overrides)
     return resolve_config(loaded, config_path=config_path, cli_mode=mode, cli_seed=seed)
-
