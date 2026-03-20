@@ -65,7 +65,7 @@ def _load_hf_esm_backbone(model_path: Path) -> LoadedESMBackbone:
             )
 
     try:
-        from transformers import AutoModel, AutoTokenizer  # type: ignore
+        from transformers import AutoModelForMaskedLM, AutoTokenizer  # type: ignore
     except ImportError as exc:
         raise RuntimeError(
             "Loading a staged Hugging Face ESM model requires the optional `transformers` dependency. "
@@ -74,12 +74,22 @@ def _load_hf_esm_backbone(model_path: Path) -> LoadedESMBackbone:
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(str(model_path), local_files_only=True, trust_remote_code=False)
-        backbone = AutoModel.from_pretrained(str(model_path), local_files_only=True, trust_remote_code=False)
+        masked_lm_model = AutoModelForMaskedLM.from_pretrained(
+            str(model_path),
+            local_files_only=True,
+            trust_remote_code=False,
+        )
     except OSError as exc:
         raise RuntimeError(
             f"Unable to load the staged ESM model from {model_path}. "
             "Check that the tokenizer files and weights are fully downloaded."
         ) from exc
+
+    backbone = getattr(masked_lm_model, "esm", None)
+    if backbone is None:
+        raise RuntimeError(
+            f"Loaded ESM checkpoint from {model_path}, but could not locate the base encoder on the masked-LM wrapper."
+        )
 
     num_layers = getattr(backbone.config, "num_hidden_layers", None)
     hidden_size = getattr(backbone.config, "hidden_size", None)
