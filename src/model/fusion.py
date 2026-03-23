@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 from torch import nn
 from torch.nn.utils.weight_norm import weight_norm
@@ -37,6 +39,15 @@ def _promote_pair_dtype(left: torch.Tensor, right: torch.Tensor) -> tuple[torch.
     if right.dtype != common_dtype:
         right = right.to(common_dtype)
     return left, right
+
+
+def _disabled_autocast_context(device_type: str) -> torch.amp.autocast_mode.autocast | nullcontext:
+    """Disable AMP for numerically sensitive fusion submodules."""
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast(device_type=device_type, enabled=False)
+    if device_type == "cuda":
+        return torch.cuda.amp.autocast(enabled=False)
+    return nullcontext()
 
 
 class FCNet(nn.Module):
@@ -237,6 +248,11 @@ class BANFusion(nn.Module):
                 f"Expected {self.protein_input_dim}, received {protein_tokens.size(2)}."
             )
 
-        fused, attention_maps = self.ban(drug_pooled.unsqueeze(1), protein_tokens)
+        device_type = drug_pooled.device.type
+        with _disabled_autocast_context(device_type):
+            fused, attention_maps = self.ban(
+                drug_pooled.to(torch.float32).unsqueeze(1),
+                protein_tokens.to(torch.float32),
+            )
         self.last_attention_maps = attention_maps.detach()
         return self.classifier(fused).squeeze(-1)
