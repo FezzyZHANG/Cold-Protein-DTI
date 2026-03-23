@@ -65,17 +65,19 @@ def build_model(config: dict[str, object]) -> DTIModel:
             freeze_n_layers=int(protein_cfg["freeze_n_layers"]),
         )
 
-    fusion_input_dim = int(model_cfg["hidden_dim"])
     if fusion_cfg["name"] == "concat":
         fusion_head = ConcatFusion(
-            input_dim=fusion_input_dim,
+            drug_input_dim=int(drug_encoder.output_dim),
+            protein_input_dim=int(protein_encoder.output_dim),
             hidden_dim=int(fusion_cfg["hidden_dim"]),
             dropout=float(fusion_cfg["dropout"]),
         )
     else:
         fusion_head = BANFusion(
-            input_dim=fusion_input_dim,
-            hidden_dim=int(fusion_cfg["hidden_dim"]),
+            drug_input_dim=int(drug_encoder.output_dim),
+            protein_input_dim=int(protein_encoder.output_dim),
+            joint_dim=int(model_cfg["hidden_dim"]),
+            classifier_hidden_dim=int(fusion_cfg["hidden_dim"]),
             glimpses=int(fusion_cfg["glimpses"]),
             dropout=float(fusion_cfg["dropout"]),
         )

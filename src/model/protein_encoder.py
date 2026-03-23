@@ -1,4 +1,4 @@
-"""Protein encoder implementations for CNN and staged local ESM backbones."""
+"""Protein encoders that preserve residue-level features for downstream fusion."""
 
 from __future__ import annotations
 
@@ -8,50 +8,71 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from src.model.common import masked_mean
 from src.model.esm_support import load_esm_backbone
 
 
+def _lengths_to_mask(lengths: torch.Tensor, max_length: int) -> torch.Tensor:
+    """Convert per-sample valid lengths into a dense boolean mask."""
+
+    positions = torch.arange(max_length, device=lengths.device).unsqueeze(0)
+    return positions < lengths.unsqueeze(1)
+
+
 class CNNProteinEncoder(nn.Module):
-    """1D CNN protein encoder trained from scratch."""
+    """SCOPE-style 1D CNN protein encoder that keeps sequence positions explicit."""
 
     def __init__(self, vocab_size: int, embed_dim: int, hidden_dim: int, kernel_sizes: list[int], dropout: float) -> None:
         super().__init__()
+        if not kernel_sizes:
+            raise ValueError("kernel_sizes must contain at least one convolution width.")
+
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.convs = nn.ModuleList(
-            [
+        self.convs = nn.ModuleList()
+        self.batch_norms = nn.ModuleList()
+        in_channels = embed_dim
+        for kernel_size in kernel_sizes:
+            kernel_size = int(kernel_size)
+            if kernel_size < 1:
+                raise ValueError(f"kernel_sizes must be >= 1. Received {kernel_size}.")
+            self.convs.append(
                 nn.Conv1d(
-                    in_channels=embed_dim,
+                    in_channels=in_channels,
                     out_channels=hidden_dim,
                     kernel_size=kernel_size,
-                    padding=kernel_size // 2,
                 )
-                for kernel_size in kernel_sizes
-            ]
-        )
-        self.output_proj = nn.Linear(hidden_dim, hidden_dim)
+            )
+            self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
+            in_channels = hidden_dim
         self.dropout = nn.Dropout(dropout)
         self.output_dim = hidden_dim
 
     def forward(self, batch: dict[str, torch.Tensor | list[str]]) -> dict[str, torch.Tensor]:
         token_ids = batch["protein_tokens"]
         mask = batch["protein_mask"]
-        embedded = self.embedding(token_ids).transpose(1, 2)
+        sequence_features = self.embedding(token_ids).transpose(1, 2)
+        valid_lengths = mask.sum(dim=1)
 
-        conv_outputs = [F.gelu(conv(embedded)).transpose(1, 2) for conv in self.convs]
-        token_features = torch.stack(conv_outputs, dim=0).mean(dim=0)
-        token_features = self.dropout(self.output_proj(token_features))
-        token_features = token_features * mask.unsqueeze(-1)
-        pooled = masked_mean(token_features, mask)
+        for conv, batch_norm in zip(self.convs, self.batch_norms):
+            kernel_size = int(conv.kernel_size[0])
+            if sequence_features.size(-1) < kernel_size:
+                raise ValueError(
+                    "Protein sequence length after convolution became shorter than the next kernel size. "
+                    f"Current length: {sequence_features.size(-1)}, kernel size: {kernel_size}."
+                )
+            sequence_features = batch_norm(F.relu(conv(sequence_features)))
+            valid_lengths = (valid_lengths - kernel_size + 1).clamp_min(0)
+
+        token_features = self.dropout(sequence_features.transpose(1, 2))
+        sequence_mask = _lengths_to_mask(valid_lengths, token_features.size(1))
+        token_features = token_features * sequence_mask.unsqueeze(-1).to(token_features.dtype)
         return {
             "token_features": token_features,
-            "mask": mask,
-            "pooled": pooled,
+            "mask": sequence_mask,
         }
 
 
 class ESMProteinEncoder(nn.Module):
-    """Wrapper around local or cached ESM checkpoints for frozen or finetuned runs."""
+    """Wrapper around local or cached ESM checkpoints for sequence-resolved outputs."""
 
     def __init__(
         self,
@@ -125,7 +146,12 @@ class ESMProteinEncoder(nn.Module):
             module.eval()
         return self
 
-    def _forward_huggingface(self, sequences: list[str], device: torch.device, context: nullcontext | torch.no_grad) -> tuple[torch.Tensor, torch.Tensor]:
+    def _forward_huggingface(
+        self,
+        sequences: list[str],
+        device: torch.device,
+        context: nullcontext | torch.no_grad,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         encoded = self.tokenizer(
             sequences,
             add_special_tokens=True,
@@ -165,9 +191,7 @@ class ESMProteinEncoder(nn.Module):
 
         token_features = self.dropout(self.output_proj(token_features))
         token_features = token_features * mask.unsqueeze(-1)
-        pooled = masked_mean(token_features, mask)
         return {
             "token_features": token_features,
             "mask": mask,
-            "pooled": pooled,
         }
