@@ -50,6 +50,7 @@ wait_for_slot() {
     if has_free_slot; then
       return
     fi
+    echo "[exprS1] no free GPU slots available. Waiting..." >&2
     sleep 5
   done
 }
@@ -126,6 +127,7 @@ wait_all() {
       return "$RUN_STATUS"
     fi
 
+    echo "[exprS1] waiting for ${#GPU_LIST[@]} GPU slots to be free..." >&2
     sleep 5
   done
 }
