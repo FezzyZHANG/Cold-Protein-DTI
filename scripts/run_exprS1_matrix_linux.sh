@@ -45,26 +45,62 @@ split_csv() {
 }
 
 wait_for_slot() {
-  local running_count
   while true; do
-    running_count=0
-    for pid in "${SLOT_PIDS[@]-}"; do
-      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        running_count=$((running_count + 1))
-      fi
-    done
-    if [[ "$running_count" -lt "${#GPU_LIST[@]}" ]]; then
+    refresh_slots
+    if has_free_slot; then
       return
     fi
     sleep 5
   done
 }
 
+refresh_slots() {
+  local idx
+  local pid
+  local running_pid
+  local is_running
+  local -a running_pids=()
+
+  mapfile -t running_pids < <(jobs -pr)
+
+  for idx in "${!GPU_LIST[@]}"; do
+    pid="${SLOT_PIDS[$idx]:-}"
+    if [[ -z "$pid" ]]; then
+      continue
+    fi
+
+    is_running=0
+    for running_pid in "${running_pids[@]}"; do
+      if [[ "$running_pid" == "$pid" ]]; then
+        is_running=1
+        break
+      fi
+    done
+
+    if [[ "$is_running" -eq 0 ]]; then
+      if ! wait "$pid"; then
+        RUN_STATUS=1
+      fi
+      SLOT_PIDS[$idx]=""
+    fi
+  done
+}
+
+has_free_slot() {
+  local idx
+  for idx in "${!GPU_LIST[@]}"; do
+    if [[ -z "${SLOT_PIDS[$idx]:-}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 find_free_gpu_slot() {
   local idx
   for idx in "${!GPU_LIST[@]}"; do
     local pid="${SLOT_PIDS[$idx]:-}"
-    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+    if [[ -z "$pid" ]]; then
       echo "$idx"
       return
     fi
@@ -73,16 +109,25 @@ find_free_gpu_slot() {
 }
 
 wait_all() {
-  local status=0
-  local pid
-  for pid in "${ALL_PIDS[@]-}"; do
-    if [[ -n "$pid" ]]; then
-      if ! wait "$pid"; then
-        status=1
+  while true; do
+    local idx
+    local any_running=0
+
+    refresh_slots
+
+    for idx in "${!GPU_LIST[@]}"; do
+      if [[ -n "${SLOT_PIDS[$idx]:-}" ]]; then
+        any_running=1
+        break
       fi
+    done
+
+    if [[ "$any_running" -eq 0 ]]; then
+      return "$RUN_STATUS"
     fi
+
+    sleep 5
   done
-  return "$status"
 }
 
 cd "$PROJECT_ROOT"
@@ -108,7 +153,7 @@ echo "[exprS1] gpu ids: ${GPU_LIST[*]}"
 echo "[exprS1] configs: ${#CONFIGS[@]}"
 
 declare -a SLOT_PIDS=()
-declare -a ALL_PIDS=()
+RUN_STATUS=0
 
 for config_path in "${CONFIGS[@]}"; do
   wait_for_slot
@@ -127,7 +172,6 @@ for config_path in "${CONFIGS[@]}"; do
     "cd \"$PROJECT_ROOT\" && $RUNNER_CMD -m $TRAIN_MODULE --config \"$config_path\"" \
     >"$log_path" 2>&1 &
   SLOT_PIDS[$slot_index]=$!
-  ALL_PIDS+=("${SLOT_PIDS[$slot_index]}")
 done
 
 if wait_all; then
