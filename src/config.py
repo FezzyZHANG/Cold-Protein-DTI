@@ -400,6 +400,7 @@ def _normalize_training_config(training_cfg: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("early_stopping_patience", 5)
     normalized.setdefault("resume", False)
     normalized.setdefault("grad_clip_norm", None)
+    normalized.setdefault("max_consecutive_bad_batches", 5)
     normalized.setdefault("max_train_batches", None)
     normalized.setdefault("max_eval_batches", None)
     return normalized

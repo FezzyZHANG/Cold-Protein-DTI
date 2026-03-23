@@ -359,8 +359,10 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
     should_save_checkpoints = bool(output_cfg["save_checkpoints"])
     grad_clip_norm = training_cfg.get("grad_clip_norm")
     grad_clip_norm = None if grad_clip_norm is None else float(grad_clip_norm)
+    max_consecutive_bad_batches = max(5, int(training_cfg["max_consecutive_bad_batches"]))
     skipped_bad_batches_total = 0
     skipped_bad_batch_examples: list[dict[str, Any]] = []
+    max_consecutive_bad_batches_seen = 2
 
     if bool(training_cfg["resume"]):
         resume_checkpoint = latest_ckpt if latest_ckpt.exists() else best_ckpt if best_ckpt.exists() else None
@@ -389,11 +391,13 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
     primary_metric = str(config["metrics"]["primary"])
 
     def build_training_summary() -> dict[str, Any] | None:
-        if skipped_bad_batches_total <= 0:
+        if skipped_bad_batches_total <= 0 and max_consecutive_bad_batches_seen <= 0:
             return None
         return {
             "skipped_bad_batches": skipped_bad_batches_total,
             "skipped_bad_batch_examples": skipped_bad_batch_examples,
+            "max_consecutive_bad_batches": max_consecutive_bad_batches,
+            "max_consecutive_bad_batches_seen": max_consecutive_bad_batches_seen,
         }
 
     try:
@@ -409,6 +413,7 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
             epoch_loss = 0.0
             batch_count = 0
             skipped_bad_batches_epoch = 0
+            consecutive_bad_batches = 0
 
             for batch_index, batch in enumerate(loaders["train"]):
                 if max_train_batches is not None and batch_index >= max_train_batches:
@@ -457,12 +462,15 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
 
                     epoch_loss += loss_value
                     batch_count += 1
+                    consecutive_bad_batches *= 0.95  # Decay consecutive bad batch count to allow recovery over time
                 except NonFiniteValueError as exc:
                     optimizer.zero_grad(set_to_none=True)
                     if amp_enabled and gradients_unscaled:
                         scaler.update()
                     skipped_bad_batches_total += 1
                     skipped_bad_batches_epoch += 1
+                    consecutive_bad_batches += 1
+                    max_consecutive_bad_batches_seen = max(max_consecutive_bad_batches_seen, consecutive_bad_batches)
                     if len(skipped_bad_batch_examples) < 10:
                         skipped_bad_batch_examples.append(
                             {
@@ -473,11 +481,21 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
                             }
                         )
                     logger.warning(
-                        "Skipping bad training batch at epoch %s batch %s due to %s",
+                        "Skipping bad training batch at epoch %s batch %s due to %s (consecutive=%s/%s)",
                         epoch_index,
                         batch_index,
                         exc.quantity,
+                        consecutive_bad_batches,
+                        max_consecutive_bad_batches,
                     )
+                    if consecutive_bad_batches >= max_consecutive_bad_batches:
+                        raise NonFiniteValueError(
+                            stage="train",
+                            quantity="consecutive_bad_batches",
+                            value=float(consecutive_bad_batches),
+                            epoch=epoch_index,
+                            batch_index=batch_index,
+                        ) from exc
                     continue
 
             if batch_count == 0:

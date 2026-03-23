@@ -29,6 +29,16 @@ def _pooled_features(output: dict[str, torch.Tensor], name: str) -> torch.Tensor
     return masked_mean(token_features, mask)
 
 
+def _promote_pair_dtype(left: torch.Tensor, right: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Promote fusion inputs to a shared dtype before concatenation/attention."""
+    common_dtype = torch.promote_types(left.dtype, right.dtype)
+    if left.dtype != common_dtype:
+        left = left.to(common_dtype)
+    if right.dtype != common_dtype:
+        right = right.to(common_dtype)
+    return left, right
+
+
 class FCNet(nn.Module):
     """Simple non-linear fully connected network from the BAN reference implementation."""
 
@@ -163,6 +173,7 @@ class ConcatFusion(nn.Module):
     def forward(self, drug_output: dict[str, torch.Tensor], protein_output: dict[str, torch.Tensor]) -> torch.Tensor:
         drug_pooled = _pooled_features(drug_output, "drug")
         protein_pooled = _pooled_features(protein_output, "protein")
+        drug_pooled, protein_pooled = _promote_pair_dtype(drug_pooled, protein_pooled)
         if drug_pooled.size(0) != protein_pooled.size(0):
             raise ValueError(
                 "Drug and protein pooled features must share the same batch size. "
@@ -208,6 +219,7 @@ class BANFusion(nn.Module):
     def forward(self, drug_output: dict[str, torch.Tensor], protein_output: dict[str, torch.Tensor]) -> torch.Tensor:
         drug_pooled = _pooled_features(drug_output, "drug")
         protein_tokens = _require_rank(protein_output["token_features"], 3, "protein token_features")
+        drug_pooled, protein_tokens = _promote_pair_dtype(drug_pooled, protein_tokens)
 
         if drug_pooled.size(0) != protein_tokens.size(0):
             raise ValueError(

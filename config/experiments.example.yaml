@@ -46,6 +46,7 @@ training:
   early_stopping_patience: 3
   resume: false
   grad_clip_norm: null
+  max_consecutive_bad_batches: 5
   max_train_batches: null
   max_eval_batches: null
 

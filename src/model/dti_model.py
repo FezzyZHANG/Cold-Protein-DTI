@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+from typing import Any
+
+import torch
 from torch import nn
 
 from src.data.dataset import AMINO_ACID_VOCAB
@@ -19,8 +23,28 @@ class DTIModel(nn.Module):
         self.protein_encoder = protein_encoder
         self.fusion_head = fusion_head
 
+    @staticmethod
+    def _disabled_autocast_context(device_type: str) -> Any:
+        """Run numerically sensitive branches outside AMP when requested."""
+        if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+            return torch.amp.autocast(device_type=device_type, enabled=False)
+        if device_type == "cuda":
+            return torch.cuda.amp.autocast(enabled=False)
+        return nullcontext()
+
+    def _infer_device_type(self, batch: dict[str, object]) -> str:
+        try:
+            return next(self.parameters()).device.type
+        except StopIteration:
+            for value in batch.values():
+                if hasattr(value, "device"):
+                    return str(value.device.type)
+        return "cpu"
+
     def forward(self, batch: dict[str, object]) -> dict[str, object]:
-        drug_output = self.drug_encoder(batch)
+        device_type = self._infer_device_type(batch)
+        with self._disabled_autocast_context(device_type):
+            drug_output = self.drug_encoder(batch)
         protein_output = self.protein_encoder(batch)
         logits = self.fusion_head(drug_output, protein_output)
         return {
