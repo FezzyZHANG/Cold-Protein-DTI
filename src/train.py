@@ -94,6 +94,7 @@ def _save_checkpoint(
     epoch_index: int,
     best_metric: float,
     config: dict[str, Any],
+    val_metrics: dict[str, Any] | None = None,
 ) -> None:
     checkpoint = {
         "model_state": model.state_dict(),
@@ -101,6 +102,7 @@ def _save_checkpoint(
         "epoch": epoch_index,
         "best_metric": best_metric,
         "config": config,
+        "val_metrics": val_metrics,
     }
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     torch_module.save(checkpoint, checkpoint_path)
@@ -171,18 +173,31 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
     criterion = torch.nn.BCEWithLogitsLoss()
     scaler = torch.cuda.amp.GradScaler(enabled=bool(training_cfg["amp"]) and device.startswith("cuda"))
 
-    latest_ckpt = run_dir / "checkpoints" / "latest.pt"
     best_ckpt = run_dir / "checkpoints" / "best.pt"
+    legacy_latest_ckpt = run_dir / "checkpoints" / "latest.pt"
     start_epoch = 0
     best_metric = float("-inf")
     best_state_payload: dict[str, Any] | None = None
     epochs_without_improvement = 0
 
-    if bool(training_cfg["resume"]) and latest_ckpt.exists():
-        checkpoint = _load_checkpoint(torch, latest_ckpt, model, optimizer)
-        start_epoch = int(checkpoint.get("epoch", 0)) + 1
-        best_metric = float(checkpoint.get("best_metric", float("-inf")))
-        logger.info("Resumed from checkpoint %s at epoch %s", latest_ckpt, start_epoch)
+    if bool(training_cfg["resume"]):
+        resume_checkpoint = best_ckpt if best_ckpt.exists() else legacy_latest_ckpt if legacy_latest_ckpt.exists() else None
+        if resume_checkpoint is not None:
+            checkpoint = _load_checkpoint(torch, resume_checkpoint, model, optimizer)
+            start_epoch = int(checkpoint.get("epoch", 0)) + 1
+            best_metric = float(checkpoint.get("best_metric", float("-inf")))
+            best_val_metrics = checkpoint.get("val_metrics")
+            if isinstance(best_val_metrics, dict):
+                best_state_payload = {
+                    "epoch": int(checkpoint.get("epoch", start_epoch - 1)),
+                    "val": best_val_metrics,
+                }
+            if resume_checkpoint == legacy_latest_ckpt and not best_ckpt.exists():
+                legacy_latest_ckpt.replace(best_ckpt)
+                logger.info("Migrated legacy checkpoint %s to %s", legacy_latest_ckpt, best_ckpt)
+            logger.info("Resumed from checkpoint %s at epoch %s", resume_checkpoint, start_epoch)
+        else:
+            logger.info("Resume requested, but no checkpoint was found under %s", run_dir / "checkpoints")
 
     history: list[dict[str, Any]] = []
     max_train_batches = (
@@ -245,18 +260,9 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
             "nan" if metric_value is None else f"{metric_value:.4f}",
         )
 
-        _save_checkpoint(
-            torch_module=torch,
-            checkpoint_path=latest_ckpt,
-            model=model,
-            optimizer=optimizer,
-            epoch_index=epoch_index,
-            best_metric=max(best_metric, metric_score),
-            config=config,
-        )
-
-        if metric_score > best_metric:
-            best_metric = metric_score
+        should_update_best = metric_score > best_metric or not best_ckpt.exists()
+        if should_update_best:
+            best_metric = max(best_metric, metric_score)
             epochs_without_improvement = 0
             _save_checkpoint(
                 torch_module=torch,
@@ -266,6 +272,7 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
                 epoch_index=epoch_index,
                 best_metric=best_metric,
                 config=config,
+                val_metrics=val_metrics,
             )
             best_state_payload = {"epoch": epoch_index, "val": val_metrics}
         else:
@@ -277,6 +284,9 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
 
     if best_ckpt.exists():
         _load_checkpoint(torch, best_ckpt, model)
+    if legacy_latest_ckpt.exists() and best_ckpt.exists():
+        legacy_latest_ckpt.unlink()
+        logger.info("Removed stale legacy checkpoint %s", legacy_latest_ckpt)
 
     test_metrics = _evaluate_model(
         model=model,
