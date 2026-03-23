@@ -96,7 +96,7 @@ wait_for_slot() {
     if has_free_slot; then
       return
     fi
-    echo "[exprS1] no free GPU slots available. Waiting..." >&2
+    # echo "[exprS1] no free GPU slots available. Waiting..." >&2
     sleep 5
   done
 }
