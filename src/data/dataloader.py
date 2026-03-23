@@ -45,16 +45,20 @@ def resolve_graph_cache_path(data_cfg: dict[str, Any]) -> Path | None:
     return None
 
 
+def _summarize_frame(frame: pl.DataFrame) -> dict[str, float]:
+    return {
+        "n_rows": float(frame.height),
+        "n_drugs": float(frame.select("inchi_key").n_unique()),
+        "n_proteins": float(frame.select("target_uniprot_id").n_unique()),
+        "positive_ratio": 0.0 if frame.height == 0 else float(frame["label"].mean()),
+    }
+
+
 def describe_splits(data_cfg: dict[str, Any]) -> dict[str, dict[str, float]]:
     summary: dict[str, dict[str, float]] = {}
     for split_name, path in resolve_split_paths(data_cfg).items():
         frame = read_split_table(path)
-        summary[split_name] = {
-            "n_rows": float(frame.height),
-            "n_drugs": float(frame.select("inchi_key").n_unique()),
-            "n_proteins": float(frame.select("target_uniprot_id").n_unique()),
-            "positive_ratio": 0.0 if frame.height == 0 else float(frame["label"].mean()),
-        }
+        summary[split_name] = _summarize_frame(frame)
     return summary
 
 
@@ -68,6 +72,70 @@ def describe_graph_cache(data_cfg: dict[str, Any]) -> dict[str, Any]:
         if manifest_path.exists():
             summary["metadata"] = json.loads(manifest_path.read_text(encoding="utf-8"))
     return summary
+
+
+def _is_non_empty_graph(graph: Any) -> bool:
+    if graph is None:
+        return False
+    node_scalar = getattr(graph, "node_s", None)
+    node_vector = getattr(graph, "node_v", None)
+    edge_index = getattr(graph, "edge_index", None)
+    edge_scalar = getattr(graph, "edge_s", None)
+    edge_vector = getattr(graph, "edge_v", None)
+    if node_scalar is None or node_vector is None or edge_index is None or edge_scalar is None or edge_vector is None:
+        return False
+    if getattr(node_scalar, "ndim", None) != 2 or int(node_scalar.shape[0]) == 0:
+        return False
+    if getattr(node_vector, "ndim", None) != 3 or int(node_vector.shape[0]) == 0:
+        return False
+    if getattr(edge_index, "ndim", None) != 2 or int(edge_index.shape[0]) != 2 or int(edge_index.shape[1]) == 0:
+        return False
+    if getattr(edge_scalar, "ndim", None) != 2 or int(edge_scalar.shape[0]) == 0:
+        return False
+    if getattr(edge_vector, "ndim", None) != 3 or int(edge_vector.shape[0]) == 0:
+        return False
+    num_nodes = getattr(graph, "num_nodes", None)
+    if num_nodes is None:
+        num_nodes = int(node_scalar.shape[0])
+    return int(num_nodes) > 0
+
+
+def _filter_frame_by_graph_availability(
+    frame: pl.DataFrame,
+    graph_store: dict[str, Any],
+) -> tuple[pl.DataFrame, dict[str, Any]]:
+    normalized = frame.with_columns(pl.col("inchi_key").cast(pl.Utf8))
+    unique_keys = normalized["inchi_key"].unique().to_list()
+
+    valid_keys: list[str] = []
+    missing_keys: list[str] = []
+    empty_graph_keys: list[str] = []
+    for inchi_key in unique_keys:
+        if inchi_key is None:
+            missing_keys.append("<null>")
+            continue
+        graph = graph_store.get(inchi_key)
+        if graph is None:
+            missing_keys.append(str(inchi_key))
+            continue
+        if not _is_non_empty_graph(graph):
+            empty_graph_keys.append(str(inchi_key))
+            continue
+        valid_keys.append(str(inchi_key))
+
+    filtered = normalized.filter(pl.col("inchi_key").is_in(valid_keys))
+    stats = {
+        "rows_before": float(normalized.height),
+        "rows_after": float(filtered.height),
+        "dropped_rows": float(normalized.height - filtered.height),
+        "missing_graph_keys": float(len(missing_keys)),
+        "empty_graph_keys": float(len(empty_graph_keys)),
+    }
+    if missing_keys:
+        stats["missing_graph_examples"] = missing_keys[:5]
+    if empty_graph_keys:
+        stats["empty_graph_examples"] = empty_graph_keys[:5]
+    return filtered, stats
 
 
 def build_dataloaders(config: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -86,14 +154,25 @@ def build_dataloaders(config: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
         )
     graph_store, graph_metadata = load_graph_store(graph_cache_path)
     frames = {name: read_split_table(path) for name, path in split_paths.items()}
+    filtered_frames: dict[str, pl.DataFrame] = {}
+    filtering_summary: dict[str, dict[str, Any]] = {}
+    for name, frame in frames.items():
+        filtered_frame, filter_stats = _filter_frame_by_graph_availability(frame, graph_store)
+        if filtered_frame.height == 0:
+            raise RuntimeError(
+                f"Split `{name}` has zero usable rows after graph filtering. "
+                "Check graph cache coverage and molecule preprocessing outputs."
+            )
+        filtered_frames[name] = filtered_frame
+        filtering_summary[name] = filter_stats
 
     datasets = {
         name: DTIDataset(
-            frame=frame,
+            frame=filtered_frames[name],
             graph_store=graph_store,
             max_protein_length=int(data_cfg["max_protein_length"]),
         )
-        for name, frame in frames.items()
+        for name in filtered_frames
     }
 
     common_loader_kwargs = {
@@ -111,7 +190,8 @@ def build_dataloaders(config: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
 
     metadata = {
         "paths": {name: str(path) for name, path in split_paths.items()},
-        "summary": describe_splits(data_cfg),
+        "summary": {name: _summarize_frame(frame) for name, frame in filtered_frames.items()},
+        "filtering": filtering_summary,
         "graph_cache": {
             "path": str(graph_cache_path),
             "num_graphs": len(graph_store),
