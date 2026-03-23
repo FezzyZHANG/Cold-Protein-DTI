@@ -267,6 +267,7 @@ def _write_training_metrics(
     best_state_payload: dict[str, Any] | None,
     history: list[dict[str, Any]],
     test_metrics: dict[str, Any] | None = None,
+    training_summary: dict[str, Any] | None = None,
     termination: dict[str, Any] | None = None,
 ) -> None:
     payload = {
@@ -280,6 +281,8 @@ def _write_training_metrics(
     }
     if test_metrics is not None:
         payload["test"] = test_metrics
+    if training_summary is not None:
+        payload["training_summary"] = training_summary
     if termination is not None:
         payload["termination"] = termination
         if termination.get("reason") == "keyboard_interrupt":
@@ -356,6 +359,8 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
     should_save_checkpoints = bool(output_cfg["save_checkpoints"])
     grad_clip_norm = training_cfg.get("grad_clip_norm")
     grad_clip_norm = None if grad_clip_norm is None else float(grad_clip_norm)
+    skipped_bad_batches_total = 0
+    skipped_bad_batch_examples: list[dict[str, Any]] = []
 
     if bool(training_cfg["resume"]):
         resume_checkpoint = latest_ckpt if latest_ckpt.exists() else best_ckpt if best_ckpt.exists() else None
@@ -382,6 +387,15 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
     )
     max_eval_batches = int(training_cfg["max_eval_batches"]) if training_cfg["max_eval_batches"] is not None else None
     primary_metric = str(config["metrics"]["primary"])
+
+    def build_training_summary() -> dict[str, Any] | None:
+        if skipped_bad_batches_total <= 0:
+            return None
+        return {
+            "skipped_bad_batches": skipped_bad_batches_total,
+            "skipped_bad_batch_examples": skipped_bad_batch_examples,
+        }
+
     try:
         current_stage = "dataloaders"
         loaders, loader_metadata = build_dataloaders(config)
@@ -394,54 +408,80 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
             model.train()
             epoch_loss = 0.0
             batch_count = 0
+            skipped_bad_batches_epoch = 0
 
             for batch_index, batch in enumerate(loaders["train"]):
                 if max_train_batches is not None and batch_index >= max_train_batches:
                     break
                 batch = _move_batch_to_device(batch, device)
                 optimizer.zero_grad(set_to_none=True)
+                gradients_unscaled = False
 
-                with _autocast_context(torch, device=device, enabled=amp_enabled):
-                    outputs = model(batch)
-                    loss = criterion(outputs["logits"], batch["labels"])
+                try:
+                    with _autocast_context(torch, device=device, enabled=amp_enabled):
+                        outputs = model(batch)
+                        loss = criterion(outputs["logits"], batch["labels"])
 
-                _ensure_finite_tensor(
-                    torch,
-                    outputs["logits"],
-                    stage="train",
-                    quantity="logits",
-                    epoch=epoch_index,
-                    batch_index=batch_index,
-                )
-                loss_value = _coerce_finite_float(
-                    loss.item(),
-                    stage="train",
-                    quantity="loss",
-                    epoch=epoch_index,
-                    batch_index=batch_index,
-                )
-
-                scaler.scale(loss).backward()
-                if amp_enabled:
-                    scaler.unscale_(optimizer)
-                if grad_clip_norm is not None:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                    _coerce_finite_float(
-                        grad_norm,
+                    _ensure_finite_tensor(
+                        torch,
+                        outputs["logits"],
                         stage="train",
-                        quantity="grad_norm",
+                        quantity="logits",
                         epoch=epoch_index,
                         batch_index=batch_index,
                     )
-                _ensure_finite_gradients(torch, model, epoch=epoch_index, batch_index=batch_index)
-                scaler.step(optimizer)
-                scaler.update()
+                    loss_value = _coerce_finite_float(
+                        loss.item(),
+                        stage="train",
+                        quantity="loss",
+                        epoch=epoch_index,
+                        batch_index=batch_index,
+                    )
 
-                epoch_loss += loss_value
-                batch_count += 1
+                    scaler.scale(loss).backward()
+                    if amp_enabled:
+                        scaler.unscale_(optimizer)
+                        gradients_unscaled = True
+                    if grad_clip_norm is not None:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                        _coerce_finite_float(
+                            grad_norm,
+                            stage="train",
+                            quantity="grad_norm",
+                            epoch=epoch_index,
+                            batch_index=batch_index,
+                        )
+                    _ensure_finite_gradients(torch, model, epoch=epoch_index, batch_index=batch_index)
+                    scaler.step(optimizer)
+                    scaler.update()
+
+                    epoch_loss += loss_value
+                    batch_count += 1
+                except NonFiniteValueError as exc:
+                    optimizer.zero_grad(set_to_none=True)
+                    if amp_enabled and gradients_unscaled:
+                        scaler.update()
+                    skipped_bad_batches_total += 1
+                    skipped_bad_batches_epoch += 1
+                    if len(skipped_bad_batch_examples) < 10:
+                        skipped_bad_batch_examples.append(
+                            {
+                                "epoch": epoch_index,
+                                "batch_index": batch_index,
+                                "quantity": exc.quantity,
+                                "observed_value": exc.value,
+                            }
+                        )
+                    logger.warning(
+                        "Skipping bad training batch at epoch %s batch %s due to %s",
+                        epoch_index,
+                        batch_index,
+                        exc.quantity,
+                    )
+                    continue
 
             if batch_count == 0:
-                raise RuntimeError("Training loader produced zero batches.")
+                raise NonFiniteValueError(stage="train", quantity="all_batches_skipped", epoch=epoch_index)
 
             train_loss = _coerce_finite_float(epoch_loss / batch_count, stage="train", quantity="avg_loss", epoch=epoch_index)
             current_stage = "validation"
@@ -465,13 +505,16 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
                 {
                     "epoch": epoch_index,
                     "train_loss": train_loss,
+                    "train_batches": batch_count,
+                    "skipped_bad_batches": skipped_bad_batches_epoch,
                     "val": val_metrics,
                 }
             )
             logger.info(
-                "Epoch %s | train_loss=%.4f | val_%s=%s",
+                "Epoch %s | train_loss=%.4f | skipped_bad_batches=%s | val_%s=%s",
                 epoch_index,
                 train_loss,
+                skipped_bad_batches_epoch,
                 primary_metric,
                 "nan" if metric_value is None else f"{metric_value:.4f}",
             )
@@ -538,6 +581,7 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
             data_summary=data_summary,
             best_state_payload=best_state_payload,
             history=history,
+            training_summary=build_training_summary(),
             test_metrics=test_metrics,
         )
         logger.info("Training finished. Metrics written to %s", run_dir / "metrics.json")
@@ -577,6 +621,7 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
             data_summary=data_summary,
             best_state_payload=best_state_payload,
             history=history,
+            training_summary=build_training_summary(),
             test_metrics=test_metrics,
             termination=termination_payload,
         )
@@ -602,6 +647,7 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
             data_summary=data_summary,
             best_state_payload=best_state_payload,
             history=history,
+            training_summary=build_training_summary(),
             termination=termination_payload,
         )
         logger.warning(
