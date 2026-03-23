@@ -1,5 +1,5 @@
 run_name: exprS1_cp-hard_cnn_concat_s42
-seed: 42
+seed: -1
 
 data:
   dataset_name: scope_dti
