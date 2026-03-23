@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,54 @@ from src.utils import (
     try_import_torch,
     write_json,
 )
+
+
+class NonFiniteValueError(RuntimeError):
+    """Raised when training or evaluation encounters NaN/Inf values."""
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        quantity: str,
+        value: float | None = None,
+        epoch: int | None = None,
+        batch_index: int | None = None,
+    ) -> None:
+        location_parts = [f"stage={stage}", f"quantity={quantity}"]
+        if epoch is not None:
+            location_parts.append(f"epoch={epoch}")
+        if batch_index is not None:
+            location_parts.append(f"batch={batch_index}")
+        if value is not None:
+            location_parts.append(f"value={value}")
+        super().__init__("Encountered non-finite numeric value (" + ", ".join(location_parts) + ").")
+        self.stage = stage
+        self.quantity = quantity
+        self.value = value
+        self.epoch = epoch
+        self.batch_index = batch_index
+
+    def to_payload(
+        self,
+        *,
+        resume_checkpoint: Path | None,
+        best_checkpoint: Path | None,
+        best_metric: float | None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "reason": "non_finite_value",
+            "stage": self.stage,
+            "quantity": self.quantity,
+            "epoch": self.epoch,
+            "batch_index": self.batch_index,
+            "observed_value": self.value,
+            "resume_checkpoint": str(resume_checkpoint) if resume_checkpoint is not None else None,
+            "best_checkpoint": str(best_checkpoint) if best_checkpoint is not None else None,
+        }
+        if best_metric is not None and math.isfinite(best_metric):
+            payload["best_metric"] = best_metric
+        return payload
 
 
 def _move_batch_to_device(batch: dict[str, Any], device: str) -> dict[str, Any]:
@@ -49,6 +98,63 @@ def _autocast_context(torch_module: Any, device: str, enabled: bool) -> Any:
     return torch_module.cuda.amp.autocast(enabled=enabled)
 
 
+def _coerce_finite_float(
+    value: Any,
+    *,
+    stage: str,
+    quantity: str,
+    epoch: int | None = None,
+    batch_index: int | None = None,
+) -> float:
+    scalar = float(value)
+    if not math.isfinite(scalar):
+        raise NonFiniteValueError(
+            stage=stage,
+            quantity=quantity,
+            value=scalar,
+            epoch=epoch,
+            batch_index=batch_index,
+        )
+    return scalar
+
+
+def _ensure_finite_tensor(
+    torch_module: Any,
+    tensor: Any,
+    *,
+    stage: str,
+    quantity: str,
+    epoch: int | None = None,
+    batch_index: int | None = None,
+) -> None:
+    if not bool(torch_module.isfinite(tensor).all().item()):
+        raise NonFiniteValueError(
+            stage=stage,
+            quantity=quantity,
+            epoch=epoch,
+            batch_index=batch_index,
+        )
+
+
+def _ensure_finite_gradients(
+    torch_module: Any,
+    model: Any,
+    *,
+    epoch: int,
+    batch_index: int,
+) -> None:
+    for parameter_name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            continue
+        if not bool(torch_module.isfinite(parameter.grad).all().item()):
+            raise NonFiniteValueError(
+                stage="train",
+                quantity=f"gradient:{parameter_name}",
+                epoch=epoch,
+                batch_index=batch_index,
+            )
+
+
 def _evaluate_model(
     model: Any,
     loader: Any,
@@ -57,6 +163,7 @@ def _evaluate_model(
     threshold: float,
     ks: list[int],
     ef_fractions: list[float],
+    epoch: int | None = None,
     max_batches: int | None = None,
 ) -> dict[str, Any]:
     torch = try_import_torch()
@@ -78,7 +185,23 @@ def _evaluate_model(
             labels = batch["labels"]
             loss = criterion(logits, labels)
 
-            total_loss += float(loss.item())
+            _ensure_finite_tensor(
+                torch,
+                logits,
+                stage="validation",
+                quantity="logits",
+                epoch=epoch,
+                batch_index=batch_index,
+            )
+            loss_value = _coerce_finite_float(
+                loss.item(),
+                stage="validation",
+                quantity="loss",
+                epoch=epoch,
+                batch_index=batch_index,
+            )
+
+            total_loss += loss_value
             n_batches += 1
             logits_list.append(logits.detach().cpu().numpy())
             labels_list.append(labels.detach().cpu().numpy())
@@ -90,7 +213,9 @@ def _evaluate_model(
     logits_np = np.concatenate(logits_list)
     labels_np = np.concatenate(labels_list)
     scores_np = sigmoid(logits_np)
-    avg_loss = total_loss / max(n_batches, 1)
+    if not np.isfinite(scores_np).all():
+        raise NonFiniteValueError(stage="validation", quantity="scores", epoch=epoch)
+    avg_loss = _coerce_finite_float(total_loss / max(n_batches, 1), stage="validation", quantity="avg_loss", epoch=epoch)
     return build_metrics_payload(
         labels=labels_np,
         scores=scores_np,
@@ -142,7 +267,7 @@ def _write_training_metrics(
     best_state_payload: dict[str, Any] | None,
     history: list[dict[str, Any]],
     test_metrics: dict[str, Any] | None = None,
-    interruption: dict[str, Any] | None = None,
+    termination: dict[str, Any] | None = None,
 ) -> None:
     payload = {
         "status": status,
@@ -155,8 +280,10 @@ def _write_training_metrics(
     }
     if test_metrics is not None:
         payload["test"] = test_metrics
-    if interruption is not None:
-        payload["interruption"] = interruption
+    if termination is not None:
+        payload["termination"] = termination
+        if termination.get("reason") == "keyboard_interrupt":
+            payload["interruption"] = termination
     write_json(round_nested(payload), run_dir / "metrics.json")
 
 
@@ -227,6 +354,8 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
     current_epoch: int | None = None
     last_completed_epoch: int | None = None
     should_save_checkpoints = bool(output_cfg["save_checkpoints"])
+    grad_clip_norm = training_cfg.get("grad_clip_norm")
+    grad_clip_norm = None if grad_clip_norm is None else float(grad_clip_norm)
 
     if bool(training_cfg["resume"]):
         resume_checkpoint = latest_ckpt if latest_ckpt.exists() else best_ckpt if best_ckpt.exists() else None
@@ -276,17 +405,45 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
                     outputs = model(batch)
                     loss = criterion(outputs["logits"], batch["labels"])
 
+                _ensure_finite_tensor(
+                    torch,
+                    outputs["logits"],
+                    stage="train",
+                    quantity="logits",
+                    epoch=epoch_index,
+                    batch_index=batch_index,
+                )
+                loss_value = _coerce_finite_float(
+                    loss.item(),
+                    stage="train",
+                    quantity="loss",
+                    epoch=epoch_index,
+                    batch_index=batch_index,
+                )
+
                 scaler.scale(loss).backward()
+                if amp_enabled:
+                    scaler.unscale_(optimizer)
+                if grad_clip_norm is not None:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    _coerce_finite_float(
+                        grad_norm,
+                        stage="train",
+                        quantity="grad_norm",
+                        epoch=epoch_index,
+                        batch_index=batch_index,
+                    )
+                _ensure_finite_gradients(torch, model, epoch=epoch_index, batch_index=batch_index)
                 scaler.step(optimizer)
                 scaler.update()
 
-                epoch_loss += float(loss.item())
+                epoch_loss += loss_value
                 batch_count += 1
 
             if batch_count == 0:
                 raise RuntimeError("Training loader produced zero batches.")
 
-            train_loss = epoch_loss / batch_count
+            train_loss = _coerce_finite_float(epoch_loss / batch_count, stage="train", quantity="avg_loss", epoch=epoch_index)
             current_stage = "validation"
             val_metrics = _evaluate_model(
                 model=model,
@@ -296,10 +453,13 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
                 threshold=float(config["metrics"]["threshold"]),
                 ks=[int(item) for item in config["metrics"]["ks"]],
                 ef_fractions=[float(item) for item in config["metrics"]["ef_fractions"]],
+                epoch=epoch_index,
                 max_batches=max_eval_batches,
             )
 
             metric_value = val_metrics["classification"].get(primary_metric)
+            if metric_value is not None:
+                _coerce_finite_float(metric_value, stage="validation", quantity=f"metric:{primary_metric}", epoch=epoch_index)
             metric_score = float("-inf") if metric_value is None else float(metric_value)
             history.append(
                 {
@@ -316,9 +476,9 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
                 "nan" if metric_value is None else f"{metric_value:.4f}",
             )
 
-            should_update_best = metric_score > best_metric or not best_ckpt.exists()
+            should_update_best = metric_value is not None and (metric_score > best_metric or not best_ckpt.exists())
             if should_update_best:
-                best_metric = max(best_metric, metric_score)
+                best_metric = metric_score
                 epochs_without_improvement = 0
                 best_state_payload = {"epoch": epoch_index, "val": val_metrics}
                 if should_save_checkpoints:
@@ -382,9 +542,53 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
         )
         logger.info("Training finished. Metrics written to %s", run_dir / "metrics.json")
         return run_dir
+    except NonFiniteValueError as exc:
+        resume_checkpoint = latest_ckpt if latest_ckpt.exists() else best_ckpt if best_ckpt.exists() else None
+        best_checkpoint = best_ckpt if best_ckpt.exists() else None
+        termination_payload = exc.to_payload(
+            resume_checkpoint=resume_checkpoint,
+            best_checkpoint=best_checkpoint,
+            best_metric=best_metric if math.isfinite(best_metric) else None,
+        )
+        logger.error("%s", exc)
+
+        test_metrics: dict[str, Any] | None = None
+        status = "failed_non_finite"
+        if best_checkpoint is not None:
+            logger.warning("Reloading best checkpoint from %s after non-finite stop.", best_checkpoint)
+            _load_checkpoint(torch, best_checkpoint, model)
+            current_stage = "test"
+            test_metrics = _evaluate_model(
+                model=model,
+                loader=loaders["test"],
+                criterion=criterion,
+                device=device,
+                threshold=float(config["metrics"]["threshold"]),
+                ks=[int(item) for item in config["metrics"]["ks"]],
+                ef_fractions=[float(item) for item in config["metrics"]["ef_fractions"]],
+                max_batches=max_eval_batches,
+            )
+            status = "completed_with_non_finite_stop"
+
+        _write_training_metrics(
+            run_dir=run_dir,
+            config=config,
+            status=status,
+            data_summary=data_summary,
+            best_state_payload=best_state_payload,
+            history=history,
+            test_metrics=test_metrics,
+            termination=termination_payload,
+        )
+        logger.warning(
+            "Training stopped due to non-finite values during %s. Metrics written to %s",
+            exc.stage,
+            run_dir / "metrics.json",
+        )
+        return run_dir
     except KeyboardInterrupt:
         resume_checkpoint = latest_ckpt if latest_ckpt.exists() else best_ckpt if best_ckpt.exists() else None
-        interruption_payload = {
+        termination_payload = {
             "reason": "keyboard_interrupt",
             "stage": current_stage,
             "epoch": current_epoch,
@@ -398,7 +602,7 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
             data_summary=data_summary,
             best_state_payload=best_state_payload,
             history=history,
-            interruption=interruption_payload,
+            termination=termination_payload,
         )
         logger.warning(
             "Training interrupted by user during %s. Partial metrics written to %s",

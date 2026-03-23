@@ -6,6 +6,7 @@ from copy import deepcopy
 from datetime import datetime
 import json
 import logging
+import math
 from pathlib import Path
 import platform
 import random
@@ -21,10 +22,28 @@ def ensure_dir(path: str | Path) -> Path:
     return directory
 
 
+def _json_ready(value: Any) -> Any:
+    """Convert nested payloads into strict JSON-safe values."""
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, np.generic):
+        return _json_ready(value.item())
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, float):
+        return None if not math.isfinite(value) else value
+    return value
+
+
 def write_json(payload: dict[str, Any], path: str | Path) -> None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2, sort_keys=False), encoding="utf-8")
+    output_path.write_text(
+        json.dumps(_json_ready(payload), indent=2, sort_keys=False, allow_nan=False),
+        encoding="utf-8",
+    )
 
 
 def read_json(path: str | Path) -> dict[str, Any]:
@@ -74,7 +93,9 @@ def prepare_run_directory(
 def build_logger(log_path: str | Path, logger_name: str) -> logging.Logger:
     logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
-    logger.handlers.clear()
+    for handler in logger.handlers[:]:
+        handler.close()
+        logger.removeHandler(handler)
 
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
@@ -136,11 +157,14 @@ def try_import_torch() -> Any:
 
 
 def round_nested(value: Any, digits: int = 6) -> Any:
+    if isinstance(value, np.generic):
+        return round_nested(value.item(), digits=digits)
     if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
         return round(value, digits)
     if isinstance(value, dict):
         return {key: round_nested(item, digits=digits) for key, item in value.items()}
     if isinstance(value, list):
         return [round_nested(item, digits=digits) for item in value]
     return value
-
