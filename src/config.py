@@ -448,11 +448,11 @@ def resolve_config(
 
     import time
     raw["mode"] = str(cli_mode or raw.get("mode", "train")).lower()
-    if raw["seed"] is not None:
-        if raw["seed"] == -1:
+    if cli_seed is not None:
+        if cli_seed == -1:
             raw["seed"] = int(time.time()) // 1000007
         else:
-            raw["seed"] = int(raw["seed"])
+            raw["seed"] = int(cli_seed)
     else:        
         raw["seed"] = int(time.time()) // 1000007
     raw["data"] = _normalize_data_config(raw["data"])
