@@ -259,6 +259,18 @@ def _load_checkpoint(torch_module: Any, checkpoint_path: Path, model: Any, optim
     return checkpoint
 
 
+def _snapshot_model_state_to_cpu(torch_module: Any, model: Any) -> dict[str, Any]:
+    """Clone the current model weights into host RAM for later restoration."""
+    state_dict = model.state_dict()
+    snapshot: dict[str, Any] = {}
+    for key, value in state_dict.items():
+        if torch_module.is_tensor(value):
+            snapshot[key] = value.detach().cpu().clone()
+        else:
+            snapshot[key] = value
+    return snapshot
+
+
 def _write_training_metrics(
     run_dir: Path,
     config: dict[str, Any],
@@ -350,6 +362,7 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
     latest_ckpt = run_dir / "checkpoints" / "latest.pt"
     start_epoch = 0
     best_metric = float("-inf")
+    best_model_state: dict[str, Any] | None = None
     best_state_payload: dict[str, Any] | None = None
     epochs_without_improvement = 0
     history: list[dict[str, Any]] = []
@@ -380,6 +393,13 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
                         "epoch": int(checkpoint.get("epoch", start_epoch - 1)),
                         "val": best_val_metrics,
                     }
+            if best_ckpt.exists():
+                best_checkpoint = torch.load(best_ckpt, map_location="cpu")
+                checkpoint_model_state = best_checkpoint.get("model_state")
+                if isinstance(checkpoint_model_state, dict):
+                    best_model_state = checkpoint_model_state
+            if best_model_state is None:
+                best_model_state = _snapshot_model_state_to_cpu(torch, model)
             logger.info("Resumed from checkpoint %s at epoch %s", resume_checkpoint, start_epoch)
         else:
             logger.info("Resume requested, but no checkpoint was found under %s", run_dir / "checkpoints")
@@ -541,6 +561,7 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
             if should_update_best:
                 best_metric = metric_score
                 epochs_without_improvement = 0
+                best_model_state = _snapshot_model_state_to_cpu(torch, model)
                 best_state_payload = {"epoch": epoch_index, "val": val_metrics}
                 if should_save_checkpoints:
                     _save_checkpoint(
@@ -577,7 +598,9 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
                 logger.info("Early stopping triggered after %s epochs without improvement.", epochs_without_improvement)
                 break
 
-        if best_ckpt.exists():
+        if best_model_state is not None:
+            model.load_state_dict(best_model_state)
+        elif best_ckpt.exists():
             _load_checkpoint(torch, best_ckpt, model)
 
         current_stage = "test"
@@ -602,7 +625,27 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
             training_summary=build_training_summary(),
             test_metrics=test_metrics,
         )
-        logger.info("Training finished. Metrics written to %s", run_dir / "metrics.json")
+        from src.eval import write_evaluation_artifacts
+
+        evaluation_source = (
+            "post_train_in_memory_best"
+            if best_model_state is not None
+            else "post_train_checkpoint"
+            if best_ckpt.exists()
+            else "post_train_current_model"
+        )
+        write_evaluation_artifacts(
+            config=config,
+            data_summary=data_summary,
+            test_metrics=test_metrics,
+            checkpoint_path=str(best_ckpt) if best_ckpt.exists() else None,
+            source=evaluation_source,
+        )
+        logger.info(
+            "Training finished. Metrics written to %s and %s",
+            run_dir / "metrics.json",
+            run_dir / "eval_metrics.json",
+        )
         return run_dir
     except NonFiniteValueError as exc:
         resume_checkpoint = latest_ckpt if latest_ckpt.exists() else best_ckpt if best_ckpt.exists() else None
@@ -616,9 +659,13 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
 
         test_metrics: dict[str, Any] | None = None
         status = "failed_non_finite"
-        if best_checkpoint is not None:
-            logger.warning("Reloading best checkpoint from %s after non-finite stop.", best_checkpoint)
-            _load_checkpoint(torch, best_checkpoint, model)
+        if best_model_state is not None or best_checkpoint is not None:
+            if best_model_state is not None:
+                logger.warning("Reloading best in-memory model state after non-finite stop.")
+                model.load_state_dict(best_model_state)
+            elif best_checkpoint is not None:
+                logger.warning("Reloading best checkpoint from %s after non-finite stop.", best_checkpoint)
+                _load_checkpoint(torch, best_checkpoint, model)
             current_stage = "test"
             test_metrics = _evaluate_model(
                 model=model,
@@ -643,6 +690,24 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
             test_metrics=test_metrics,
             termination=termination_payload,
         )
+        if test_metrics is not None:
+            from src.eval import write_evaluation_artifacts
+
+            evaluation_source = (
+                "post_train_non_finite_in_memory_best"
+                if best_model_state is not None
+                else "post_train_non_finite_checkpoint"
+                if best_checkpoint is not None
+                else "post_train_non_finite_current_model"
+            )
+            write_evaluation_artifacts(
+                config=config,
+                data_summary=data_summary,
+                test_metrics=test_metrics,
+                checkpoint_path=str(best_checkpoint) if best_checkpoint is not None else None,
+                source=evaluation_source,
+                status="completed",
+            )
         logger.warning(
             "Training stopped due to non-finite values during %s. Metrics written to %s",
             exc.stage,

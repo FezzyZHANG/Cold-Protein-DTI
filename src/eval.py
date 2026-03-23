@@ -46,6 +46,44 @@ def _resolve_checkpoint_path(run_dir: Path, explicit_checkpoint: str | None) -> 
     )
 
 
+def write_evaluation_artifacts(
+    *,
+    config: dict[str, Any],
+    data_summary: dict[str, Any] | None,
+    test_metrics: dict[str, Any],
+    checkpoint_path: str | None,
+    source: str,
+    status: str = "completed",
+) -> dict[str, Any]:
+    run_dir = Path(config["output"]["run_dir"])
+    logger = build_logger(run_dir / "eval.log", logger_name=f"eval:{config['run_name']}")
+
+    eval_payload = {
+        "status": status,
+        "mode": "eval",
+        "run_name": config["run_name"],
+        "checkpoint": checkpoint_path,
+        "source": source,
+        "environment": environment_snapshot(),
+        "data": data_summary,
+        "test": test_metrics,
+    }
+    rounded_payload = round_nested(eval_payload)
+    write_json(rounded_payload, run_dir / "eval_metrics.json")
+
+    metrics_json = run_dir / "metrics.json"
+    if metrics_json.exists():
+        merged = deep_merge(read_json(metrics_json), {"eval": rounded_payload})
+        write_json(merged, metrics_json)
+
+    if checkpoint_path:
+        logger.info("Evaluation source checkpoint: %s", checkpoint_path)
+    else:
+        logger.info("Evaluation source: %s", source)
+    logger.info("Evaluation finished. Metrics written to %s", run_dir / "eval_metrics.json")
+    return rounded_payload
+
+
 def run_evaluation(config: dict[str, Any], checkpoint_path: str | None, dry_run: bool) -> Path:
     run_dir = Path(config["output"]["root_dir"]) / config["run_name"]
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -128,23 +166,13 @@ def run_evaluation(config: dict[str, Any], checkpoint_path: str | None, dry_run:
         loss=total_loss / max(n_batches, 1),
     )
 
-    eval_payload = {
-        "status": "completed",
-        "mode": "eval",
-        "run_name": config["run_name"],
-        "checkpoint": str(resolved_checkpoint),
-        "environment": environment_snapshot(),
-        "data": loader_metadata["summary"],
-        "test": metrics_payload,
-    }
-    write_json(round_nested(eval_payload), run_dir / "eval_metrics.json")
-
-    metrics_json = run_dir / "metrics.json"
-    if metrics_json.exists():
-        merged = deep_merge(read_json(metrics_json), {"eval": round_nested(eval_payload)})
-        write_json(merged, metrics_json)
-
-    logger.info("Evaluation finished. Metrics written to %s", run_dir / "eval_metrics.json")
+    write_evaluation_artifacts(
+        config=config,
+        data_summary=loader_metadata["summary"],
+        test_metrics=metrics_payload,
+        checkpoint_path=str(resolved_checkpoint),
+        source="checkpoint",
+    )
     return run_dir
 
 
