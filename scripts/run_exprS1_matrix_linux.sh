@@ -44,6 +44,19 @@ split_csv() {
   eval "$output_var=(\"\${parsed_values[@]}\")"
 }
 
+init_slots() {
+  local idx
+
+  SLOT_PIDS=()
+  SLOT_CONFIGS=()
+  RUN_STATUS=0
+
+  for idx in "${!GPU_LIST[@]}"; do
+    SLOT_PIDS[$idx]=""
+    SLOT_CONFIGS[$idx]=""
+  done
+}
+
 wait_for_slot() {
   while true; do
     refresh_slots
@@ -83,6 +96,7 @@ refresh_slots() {
         RUN_STATUS=1
       fi
       SLOT_PIDS[$idx]=""
+      SLOT_CONFIGS[$idx]=""
     fi
   done
 }
@@ -155,7 +169,8 @@ echo "[exprS1] gpu ids: ${GPU_LIST[*]}"
 echo "[exprS1] configs: ${#CONFIGS[@]}"
 
 declare -a SLOT_PIDS=()
-RUN_STATUS=0
+declare -a SLOT_CONFIGS=()
+init_slots
 
 for config_path in "${CONFIGS[@]}"; do
   wait_for_slot
@@ -174,6 +189,7 @@ for config_path in "${CONFIGS[@]}"; do
     "cd \"$PROJECT_ROOT\" && $RUNNER_CMD -m $TRAIN_MODULE --config \"$config_path\"" \
     >"$log_path" 2>&1 &
   SLOT_PIDS[$slot_index]=$!
+  SLOT_CONFIGS[$slot_index]="$config_name"
 done
 
 if wait_all; then
