@@ -10,6 +10,16 @@ param(
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 
+trap [System.Management.Automation.PipelineStoppedException] {
+    Write-Host "[exprS1-test] interrupt received. Exiting."
+    exit 130
+}
+
+trap [System.OperationCanceledException] {
+    Write-Host $_.Exception.Message
+    exit 130
+}
+
 function Resolve-Python {
     param([string]$RequestedPython)
 
@@ -29,6 +39,23 @@ function Resolve-Python {
     }
 
     throw "Could not find a usable Python interpreter."
+}
+
+function Invoke-ExternalCommand {
+    param(
+        [string]$Description,
+        [string]$FilePath,
+        [string[]]$Arguments
+    )
+
+    & $FilePath @Arguments
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -eq 130) {
+        throw [System.OperationCanceledException]::new("[exprS1-test] interrupted during $Description.")
+    }
+    if ($exitCode -ne 0) {
+        throw "[exprS1-test] $Description failed with exit code $exitCode."
+    }
 }
 
 $Python = Resolve-Python -RequestedPython $Python
@@ -68,19 +95,15 @@ try {
             $TrainArgs += "--dry-run"
         }
 
-        & $Python @TrainArgs
-        if ($LASTEXITCODE -ne 0) {
-            throw "Training command failed for $($ConfigFile.Name)"
-        }
+        Invoke-ExternalCommand -Description "training for $ConfigName" -FilePath $Python -Arguments $TrainArgs
 
         if (-not $DryRun -and $RunEval) {
             Write-Host "[exprS1-test] evaluating $ConfigName"
-            & $Python -m src.eval `
-                --config $ConfigFile.FullName `
-                --set "output.root_dir=$ResultsRoot"
-            if ($LASTEXITCODE -ne 0) {
-                throw "Evaluation command failed for $($ConfigFile.Name)"
-            }
+            Invoke-ExternalCommand -Description "evaluation for $ConfigName" -FilePath $Python -Arguments @(
+                "-m", "src.eval",
+                "--config", $ConfigFile.FullName,
+                "--set", "output.root_dir=$ResultsRoot"
+            )
         }
     }
 

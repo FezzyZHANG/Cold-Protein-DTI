@@ -9,6 +9,16 @@ param(
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 
+trap [System.Management.Automation.PipelineStoppedException] {
+    Write-Host "[pretest] interrupt received. Exiting."
+    exit 130
+}
+
+trap [System.OperationCanceledException] {
+    Write-Host $_.Exception.Message
+    exit 130
+}
+
 function Resolve-Python {
     param([string]$RequestedPython)
 
@@ -30,6 +40,23 @@ function Resolve-Python {
     throw "Could not find a usable Python interpreter."
 }
 
+function Invoke-ExternalCommand {
+    param(
+        [string]$Description,
+        [string]$FilePath,
+        [string[]]$Arguments
+    )
+
+    & $FilePath @Arguments
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -eq 130) {
+        throw [System.OperationCanceledException]::new("[pretest] interrupted during $Description.")
+    }
+    if ($exitCode -ne 0) {
+        throw "[pretest] $Description failed with exit code $exitCode."
+    }
+}
+
 if (-not $InputPath) {
     $InputPath = Join-Path $ProjectRoot "data\scope_dti_with_inchikey.parquet"
 }
@@ -44,23 +71,31 @@ Push-Location $ProjectRoot
 try {
     if ($Mode -eq "cp-hard") {
         & $Python -c "import importlib.util, sys; has_torch = importlib.util.find_spec('torch') is not None; has_transformers = importlib.util.find_spec('transformers') is not None; sys.exit(0 if has_torch and has_transformers else 1)" *> $null
+        if ($LASTEXITCODE -eq 130) {
+            throw [System.OperationCanceledException]::new("[pretest] interrupted during dependency check.")
+        }
         if ($LASTEXITCODE -ne 0) {
             throw "cp-hard pre-experiment preparation requires torch and transformers. Run `uv sync --extra esm` first."
         }
     }
 
     Write-Host "[pretest] preparing split files in $SplitDir"
-    & $Python "scripts/prepare_dti_splits.py" `
-        --input-path $InputPath `
-        --output-dir $SplitDir `
-        --mode $Mode `
-        --seed 42 `
-        --subsample-n $SubsampleN `
-        --build-graph-cache
+    Invoke-ExternalCommand -Description "split preparation" -FilePath $Python -Arguments @(
+        "scripts/prepare_dti_splits.py",
+        "--input-path", $InputPath,
+        "--output-dir", $SplitDir,
+        "--mode", $Mode,
+        "--seed", "42",
+        "--subsample-n", "$SubsampleN",
+        "--build-graph-cache"
+    )
 
     $DryRun = $false
     & $Python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('torch') else 1)" *> $null
     $ImportTorchExitCode = $LASTEXITCODE
+    if ($ImportTorchExitCode -eq 130) {
+        throw [System.OperationCanceledException]::new("[pretest] interrupted during dependency check.")
+    }
     if ($ImportTorchExitCode -ne 0) {
         $DryRun = $true
         Write-Host "[pretest] torch is not installed. Falling back to --dry-run validation."
@@ -90,11 +125,11 @@ try {
     }
 
     Write-Host "[pretest] launching training validation run: $RunName"
-    & $Python @TrainArgs
+    Invoke-ExternalCommand -Description "training validation run" -FilePath $Python -Arguments $TrainArgs
 
     if (-not $DryRun -and -not $SkipEval) {
         Write-Host "[pretest] launching evaluation validation run: $RunName"
-        & $Python -m src.eval @CommonArgs
+        Invoke-ExternalCommand -Description "evaluation validation run" -FilePath $Python -Arguments (@("-m", "src.eval") + $CommonArgs)
     }
 } finally {
     Pop-Location

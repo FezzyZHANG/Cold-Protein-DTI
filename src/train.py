@@ -95,6 +95,7 @@ def _save_checkpoint(
     best_metric: float,
     config: dict[str, Any],
     val_metrics: dict[str, Any] | None = None,
+    best_state: dict[str, Any] | None = None,
 ) -> None:
     checkpoint = {
         "model_state": model.state_dict(),
@@ -103,6 +104,7 @@ def _save_checkpoint(
         "best_metric": best_metric,
         "config": config,
         "val_metrics": val_metrics,
+        "best_state": best_state,
     }
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     torch_module.save(checkpoint, checkpoint_path)
@@ -114,6 +116,32 @@ def _load_checkpoint(torch_module: Any, checkpoint_path: Path, model: Any, optim
     if optimizer is not None and "optimizer_state" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state"])
     return checkpoint
+
+
+def _write_training_metrics(
+    run_dir: Path,
+    config: dict[str, Any],
+    status: str,
+    data_summary: dict[str, Any] | None,
+    best_state_payload: dict[str, Any] | None,
+    history: list[dict[str, Any]],
+    test_metrics: dict[str, Any] | None = None,
+    interruption: dict[str, Any] | None = None,
+) -> None:
+    payload = {
+        "status": status,
+        "mode": config["mode"],
+        "run_name": config["run_name"],
+        "environment": environment_snapshot(),
+        "data": data_summary,
+        "best": best_state_payload,
+        "history": history,
+    }
+    if test_metrics is not None:
+        payload["test"] = test_metrics
+    if interruption is not None:
+        payload["interruption"] = interruption
+    write_json(round_nested(payload), run_dir / "metrics.json")
 
 
 def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = None) -> Path:
@@ -135,6 +163,7 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
 
     split_summary = describe_splits(config["data"])
     graph_cache_summary = describe_graph_cache(config["data"])
+    data_summary: dict[str, Any] | None = round_nested(split_summary)
     logger.info("Resolved config from %s", config["config_path"])
     logger.info("Run directory: %s", run_dir)
     logger.info("Split summary: %s", round_nested(split_summary))
@@ -162,9 +191,6 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
     model = build_model(config)
     model = model.to(device)
 
-    loaders, loader_metadata = build_dataloaders(config)
-    logger.info("Loader metadata: %s", round_nested(loader_metadata))
-
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(training_cfg["lr"]),
@@ -174,67 +200,152 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
     scaler = torch.cuda.amp.GradScaler(enabled=bool(training_cfg["amp"]) and device.startswith("cuda"))
 
     best_ckpt = run_dir / "checkpoints" / "best.pt"
-    legacy_latest_ckpt = run_dir / "checkpoints" / "latest.pt"
+    latest_ckpt = run_dir / "checkpoints" / "latest.pt"
     start_epoch = 0
     best_metric = float("-inf")
     best_state_payload: dict[str, Any] | None = None
     epochs_without_improvement = 0
+    history: list[dict[str, Any]] = []
+    current_stage = "setup"
+    current_epoch: int | None = None
+    last_completed_epoch: int | None = None
+    should_save_checkpoints = bool(output_cfg["save_checkpoints"])
 
     if bool(training_cfg["resume"]):
-        resume_checkpoint = best_ckpt if best_ckpt.exists() else legacy_latest_ckpt if legacy_latest_ckpt.exists() else None
+        resume_checkpoint = latest_ckpt if latest_ckpt.exists() else best_ckpt if best_ckpt.exists() else None
         if resume_checkpoint is not None:
             checkpoint = _load_checkpoint(torch, resume_checkpoint, model, optimizer)
             start_epoch = int(checkpoint.get("epoch", 0)) + 1
             best_metric = float(checkpoint.get("best_metric", float("-inf")))
-            best_val_metrics = checkpoint.get("val_metrics")
-            if isinstance(best_val_metrics, dict):
-                best_state_payload = {
-                    "epoch": int(checkpoint.get("epoch", start_epoch - 1)),
-                    "val": best_val_metrics,
-                }
-            if resume_checkpoint == legacy_latest_ckpt and not best_ckpt.exists():
-                legacy_latest_ckpt.replace(best_ckpt)
-                logger.info("Migrated legacy checkpoint %s to %s", legacy_latest_ckpt, best_ckpt)
+            checkpoint_best_state = checkpoint.get("best_state")
+            if isinstance(checkpoint_best_state, dict):
+                best_state_payload = checkpoint_best_state
+            else:
+                best_val_metrics = checkpoint.get("val_metrics")
+                if isinstance(best_val_metrics, dict):
+                    best_state_payload = {
+                        "epoch": int(checkpoint.get("epoch", start_epoch - 1)),
+                        "val": best_val_metrics,
+                    }
             logger.info("Resumed from checkpoint %s at epoch %s", resume_checkpoint, start_epoch)
         else:
             logger.info("Resume requested, but no checkpoint was found under %s", run_dir / "checkpoints")
 
-    history: list[dict[str, Any]] = []
     max_train_batches = (
         int(training_cfg["max_train_batches"]) if training_cfg["max_train_batches"] is not None else max_steps
     )
     max_eval_batches = int(training_cfg["max_eval_batches"]) if training_cfg["max_eval_batches"] is not None else None
     primary_metric = str(config["metrics"]["primary"])
+    try:
+        current_stage = "dataloaders"
+        loaders, loader_metadata = build_dataloaders(config)
+        data_summary = loader_metadata["summary"]
+        logger.info("Loader metadata: %s", round_nested(loader_metadata))
 
-    for epoch_index in range(start_epoch, int(training_cfg["epochs"])):
-        model.train()
-        epoch_loss = 0.0
-        batch_count = 0
+        current_stage = "train"
+        for epoch_index in range(start_epoch, int(training_cfg["epochs"])):
+            current_epoch = epoch_index
+            model.train()
+            epoch_loss = 0.0
+            batch_count = 0
 
-        for batch_index, batch in enumerate(loaders["train"]):
-            if max_train_batches is not None and batch_index >= max_train_batches:
+            for batch_index, batch in enumerate(loaders["train"]):
+                if max_train_batches is not None and batch_index >= max_train_batches:
+                    break
+                batch = _move_batch_to_device(batch, device)
+                optimizer.zero_grad(set_to_none=True)
+
+                with torch.cuda.amp.autocast(enabled=bool(training_cfg["amp"]) and device.startswith("cuda")):
+                    outputs = model(batch)
+                    loss = criterion(outputs["logits"], batch["labels"])
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                epoch_loss += float(loss.item())
+                batch_count += 1
+
+            if batch_count == 0:
+                raise RuntimeError("Training loader produced zero batches.")
+
+            train_loss = epoch_loss / batch_count
+            current_stage = "validation"
+            val_metrics = _evaluate_model(
+                model=model,
+                loader=loaders["val"],
+                criterion=criterion,
+                device=device,
+                threshold=float(config["metrics"]["threshold"]),
+                ks=[int(item) for item in config["metrics"]["ks"]],
+                ef_fractions=[float(item) for item in config["metrics"]["ef_fractions"]],
+                max_batches=max_eval_batches,
+            )
+
+            metric_value = val_metrics["classification"].get(primary_metric)
+            metric_score = float("-inf") if metric_value is None else float(metric_value)
+            history.append(
+                {
+                    "epoch": epoch_index,
+                    "train_loss": train_loss,
+                    "val": val_metrics,
+                }
+            )
+            logger.info(
+                "Epoch %s | train_loss=%.4f | val_%s=%s",
+                epoch_index,
+                train_loss,
+                primary_metric,
+                "nan" if metric_value is None else f"{metric_value:.4f}",
+            )
+
+            should_update_best = metric_score > best_metric or not best_ckpt.exists()
+            if should_update_best:
+                best_metric = max(best_metric, metric_score)
+                epochs_without_improvement = 0
+                best_state_payload = {"epoch": epoch_index, "val": val_metrics}
+                if should_save_checkpoints:
+                    _save_checkpoint(
+                        torch_module=torch,
+                        checkpoint_path=best_ckpt,
+                        model=model,
+                        optimizer=optimizer,
+                        epoch_index=epoch_index,
+                        best_metric=best_metric,
+                        config=config,
+                        val_metrics=val_metrics,
+                        best_state=best_state_payload,
+                    )
+            else:
+                epochs_without_improvement += 1
+
+            if should_save_checkpoints:
+                _save_checkpoint(
+                    torch_module=torch,
+                    checkpoint_path=latest_ckpt,
+                    model=model,
+                    optimizer=optimizer,
+                    epoch_index=epoch_index,
+                    best_metric=best_metric,
+                    config=config,
+                    val_metrics=val_metrics,
+                    best_state=best_state_payload,
+                )
+
+            last_completed_epoch = epoch_index
+            current_stage = "train"
+
+            if epochs_without_improvement >= int(training_cfg["early_stopping_patience"]):
+                logger.info("Early stopping triggered after %s epochs without improvement.", epochs_without_improvement)
                 break
-            batch = _move_batch_to_device(batch, device)
-            optimizer.zero_grad(set_to_none=True)
 
-            with torch.cuda.amp.autocast(enabled=bool(training_cfg["amp"]) and device.startswith("cuda")):
-                outputs = model(batch)
-                loss = criterion(outputs["logits"], batch["labels"])
+        if best_ckpt.exists():
+            _load_checkpoint(torch, best_ckpt, model)
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            epoch_loss += float(loss.item())
-            batch_count += 1
-
-        if batch_count == 0:
-            raise RuntimeError("Training loader produced zero batches.")
-
-        train_loss = epoch_loss / batch_count
-        val_metrics = _evaluate_model(
+        current_stage = "test"
+        test_metrics = _evaluate_model(
             model=model,
-            loader=loaders["val"],
+            loader=loaders["test"],
             criterion=criterion,
             device=device,
             threshold=float(config["metrics"]["threshold"]),
@@ -243,75 +354,43 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
             max_batches=max_eval_batches,
         )
 
-        metric_value = val_metrics["classification"].get(primary_metric)
-        metric_score = float("-inf") if metric_value is None else float(metric_value)
-        history.append(
-            {
-                "epoch": epoch_index,
-                "train_loss": train_loss,
-                "val": val_metrics,
-            }
+        _write_training_metrics(
+            run_dir=run_dir,
+            config=config,
+            status="completed",
+            data_summary=data_summary,
+            best_state_payload=best_state_payload,
+            history=history,
+            test_metrics=test_metrics,
         )
-        logger.info(
-            "Epoch %s | train_loss=%.4f | val_%s=%s",
-            epoch_index,
-            train_loss,
-            primary_metric,
-            "nan" if metric_value is None else f"{metric_value:.4f}",
+        logger.info("Training finished. Metrics written to %s", run_dir / "metrics.json")
+        return run_dir
+    except KeyboardInterrupt:
+        resume_checkpoint = latest_ckpt if latest_ckpt.exists() else best_ckpt if best_ckpt.exists() else None
+        interruption_payload = {
+            "reason": "keyboard_interrupt",
+            "stage": current_stage,
+            "epoch": current_epoch,
+            "last_completed_epoch": last_completed_epoch,
+            "resume_checkpoint": str(resume_checkpoint) if resume_checkpoint is not None else None,
+        }
+        _write_training_metrics(
+            run_dir=run_dir,
+            config=config,
+            status="interrupted",
+            data_summary=data_summary,
+            best_state_payload=best_state_payload,
+            history=history,
+            interruption=interruption_payload,
         )
-
-        should_update_best = metric_score > best_metric or not best_ckpt.exists()
-        if should_update_best:
-            best_metric = max(best_metric, metric_score)
-            epochs_without_improvement = 0
-            _save_checkpoint(
-                torch_module=torch,
-                checkpoint_path=best_ckpt,
-                model=model,
-                optimizer=optimizer,
-                epoch_index=epoch_index,
-                best_metric=best_metric,
-                config=config,
-                val_metrics=val_metrics,
-            )
-            best_state_payload = {"epoch": epoch_index, "val": val_metrics}
-        else:
-            epochs_without_improvement += 1
-
-        if epochs_without_improvement >= int(training_cfg["early_stopping_patience"]):
-            logger.info("Early stopping triggered after %s epochs without improvement.", epochs_without_improvement)
-            break
-
-    if best_ckpt.exists():
-        _load_checkpoint(torch, best_ckpt, model)
-    if legacy_latest_ckpt.exists() and best_ckpt.exists():
-        legacy_latest_ckpt.unlink()
-        logger.info("Removed stale legacy checkpoint %s", legacy_latest_ckpt)
-
-    test_metrics = _evaluate_model(
-        model=model,
-        loader=loaders["test"],
-        criterion=criterion,
-        device=device,
-        threshold=float(config["metrics"]["threshold"]),
-        ks=[int(item) for item in config["metrics"]["ks"]],
-        ef_fractions=[float(item) for item in config["metrics"]["ef_fractions"]],
-        max_batches=max_eval_batches,
-    )
-
-    payload = {
-        "status": "completed",
-        "mode": config["mode"],
-        "run_name": config["run_name"],
-        "environment": environment_snapshot(),
-        "data": loader_metadata["summary"],
-        "best": best_state_payload,
-        "test": test_metrics,
-        "history": history,
-    }
-    write_json(round_nested(payload), run_dir / "metrics.json")
-    logger.info("Training finished. Metrics written to %s", run_dir / "metrics.json")
-    return run_dir
+        logger.warning(
+            "Training interrupted by user during %s. Partial metrics written to %s",
+            current_stage,
+            run_dir / "metrics.json",
+        )
+        if resume_checkpoint is not None:
+            logger.warning("Resume is available from checkpoint %s", resume_checkpoint)
+        raise
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -338,6 +417,8 @@ def main() -> None:
         run_training(config=config, dry_run=bool(args.dry_run), max_steps=args.max_steps)
     except ConfigError as exc:
         raise SystemExit(f"[config-error] {exc}") from exc
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
 
 
 if __name__ == "__main__":

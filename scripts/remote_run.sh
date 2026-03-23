@@ -3,6 +3,8 @@ set -euo pipefail
 
 MODE="${1:-}"
 EXP_PATH="${2:-}"
+shift $(( $# >= 2 ? 2 : $# ))
+EXTRA_ARGS=("$@")
 
 if [[ -z "$MODE" || -z "$EXP_PATH" ]]; then
   echo "Usage: bash scripts/remote_run.sh <train|eval> <config.yaml>"
@@ -32,12 +34,19 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi || true
 fi
 
+handle_interrupt() {
+  echo "[INFO] interrupt received. Exiting remote run wrapper." >&2
+  exit 130
+}
+
+trap handle_interrupt INT TERM
+
 case "$MODE" in
   train)
-    python -m src.train --config "$EXP_PATH"
+    exec python -m src.train --config "$EXP_PATH" "${EXTRA_ARGS[@]}"
     ;;
   eval)
-    python -m src.eval --config "$EXP_PATH"
+    exec python -m src.eval --config "$EXP_PATH" "${EXTRA_ARGS[@]}"
     ;;
   *)
     echo "Unknown mode: $MODE"

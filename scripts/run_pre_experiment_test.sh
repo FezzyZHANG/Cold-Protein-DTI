@@ -7,6 +7,59 @@ MODE="${MODE:-cp-hard}"
 SUBSAMPLE_N="${SUBSAMPLE_N:-500000}"
 INPUT_PATH="${INPUT_PATH:-$PROJECT_ROOT/data/scope_dti_with_inchikey.parquet}"
 SKIP_EVAL="${SKIP_EVAL:-0}"
+ACTIVE_CHILD_PID=""
+
+handle_interrupt() {
+  echo "[pretest] interrupt received. Stopping active command..." >&2
+  if [[ -n "${ACTIVE_CHILD_PID:-}" ]] && kill -0 "$ACTIVE_CHILD_PID" >/dev/null 2>&1; then
+    kill -INT "$ACTIVE_CHILD_PID" >/dev/null 2>&1 || true
+    set +e
+    wait "$ACTIVE_CHILD_PID"
+    set -e
+    ACTIVE_CHILD_PID=""
+  fi
+  exit 130
+}
+
+run_step() {
+  local description="$1"
+  shift
+
+  "$@" &
+  ACTIVE_CHILD_PID=$!
+  set +e
+  wait "$ACTIVE_CHILD_PID"
+  local exit_code=$?
+  set -e
+  ACTIVE_CHILD_PID=""
+
+  if [[ "$exit_code" -eq 130 ]]; then
+    echo "[pretest] interrupted during $description." >&2
+    exit 130
+  fi
+  if [[ "$exit_code" -ne 0 ]]; then
+    echo "[pretest] $description failed with exit code $exit_code." >&2
+    exit "$exit_code"
+  fi
+}
+
+run_quiet_check() {
+  "$@" >/dev/null 2>&1 &
+  ACTIVE_CHILD_PID=$!
+  set +e
+  wait "$ACTIVE_CHILD_PID"
+  local exit_code=$?
+  set -e
+  ACTIVE_CHILD_PID=""
+
+  if [[ "$exit_code" -eq 130 ]]; then
+    echo "[pretest] interrupted during dependency check." >&2
+    exit 130
+  fi
+  return "$exit_code"
+}
+
+trap handle_interrupt INT TERM
 
 resolve_python() {
   if [[ -n "$PYTHON_BIN" ]]; then
@@ -39,14 +92,14 @@ CONFIG_PATH="$PROJECT_ROOT/config/experiments/preexperiment_cnn_smoke.yaml"
 cd "$PROJECT_ROOT"
 
 if [[ "$MODE" == "cp-hard" ]]; then
-  if ! "$PYTHON_BIN" -c "import importlib.util, sys; has_torch = importlib.util.find_spec('torch') is not None; has_transformers = importlib.util.find_spec('transformers') is not None; sys.exit(0 if has_torch and has_transformers else 1)" >/dev/null 2>&1; then
+  if ! run_quiet_check "$PYTHON_BIN" -c "import importlib.util, sys; has_torch = importlib.util.find_spec('torch') is not None; has_transformers = importlib.util.find_spec('transformers') is not None; sys.exit(0 if has_torch and has_transformers else 1)"; then
     echo "[pretest] cp-hard pre-experiment preparation requires torch and transformers. Run 'uv sync --extra esm' first." >&2
     exit 1
   fi
 fi
 
 echo "[pretest] preparing split files in $SPLIT_DIR"
-"$PYTHON_BIN" scripts/prepare_dti_splits.py \
+run_step "split preparation" "$PYTHON_BIN" scripts/prepare_dti_splits.py \
   --input-path "$INPUT_PATH" \
   --output-dir "$SPLIT_DIR" \
   --mode "$MODE" \
@@ -55,7 +108,7 @@ echo "[pretest] preparing split files in $SPLIT_DIR"
   --build-graph-cache
 
 DRY_RUN=0
-if ! "$PYTHON_BIN" -c "import torch" >/dev/null 2>&1; then
+if ! run_quiet_check "$PYTHON_BIN" -c "import torch"; then
   DRY_RUN=1
   echo "[pretest] torch is not installed. Falling back to --dry-run validation."
 fi
@@ -84,9 +137,9 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 fi
 
 echo "[pretest] launching training validation run: $RUN_NAME"
-"$PYTHON_BIN" "${TRAIN_ARGS[@]}"
+run_step "training validation run" "$PYTHON_BIN" "${TRAIN_ARGS[@]}"
 
 if [[ "$DRY_RUN" -eq 0 && "$SKIP_EVAL" -ne 1 ]]; then
   echo "[pretest] launching evaluation validation run: $RUN_NAME"
-  "$PYTHON_BIN" -m src.eval "${COMMON_ARGS[@]}"
+  run_step "evaluation validation run" "$PYTHON_BIN" -m src.eval "${COMMON_ARGS[@]}"
 fi

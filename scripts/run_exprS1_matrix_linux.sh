@@ -7,6 +7,7 @@ LOG_ROOT="${LOG_ROOT:-$PROJECT_ROOT/logs/exprS1}"
 GPU_IDS="${GPU_IDS:-0,1,2,3}"
 TRAIN_MODULE="${TRAIN_MODULE:-src.train}"
 UV_SYNC_EXTRAS="${UV_SYNC_EXTRAS:---extra train --extra esm}"
+INTERRUPTED=0
 
 resolve_runner() {
   if [[ -n "${RUNNER:-}" ]]; then
@@ -55,6 +56,38 @@ init_slots() {
     SLOT_PIDS[$idx]=""
     SLOT_CONFIGS[$idx]=""
   done
+}
+
+handle_interrupt() {
+  local signal_name="${1:-INT}"
+  local idx
+  local pid
+
+  if [[ "$INTERRUPTED" -eq 1 ]]; then
+    return
+  fi
+  INTERRUPTED=1
+
+  echo "[exprS1] received ${signal_name}. Stopping active jobs..." >&2
+  for idx in "${!GPU_LIST[@]}"; do
+    pid="${SLOT_PIDS[$idx]:-}"
+    if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+      kill -INT "$pid" >/dev/null 2>&1 || true
+    fi
+  done
+
+  for idx in "${!GPU_LIST[@]}"; do
+    pid="${SLOT_PIDS[$idx]:-}"
+    if [[ -n "$pid" ]]; then
+      set +e
+      wait "$pid"
+      set -e
+      SLOT_PIDS[$idx]=""
+      SLOT_CONFIGS[$idx]=""
+    fi
+  done
+
+  exit 130
 }
 
 wait_for_slot() {
@@ -171,6 +204,8 @@ echo "[exprS1] configs: ${#CONFIGS[@]}"
 declare -a SLOT_PIDS=()
 declare -a SLOT_CONFIGS=()
 init_slots
+trap 'handle_interrupt INT' INT
+trap 'handle_interrupt TERM' TERM
 
 for config_path in "${CONFIGS[@]}"; do
   wait_for_slot
@@ -186,7 +221,7 @@ for config_path in "${CONFIGS[@]}"; do
 
   echo "[exprS1] launching $config_name on cuda:$gpu_id"
   CUDA_VISIBLE_DEVICES="$gpu_id" bash -lc \
-    "cd \"$PROJECT_ROOT\" && $RUNNER_CMD -m $TRAIN_MODULE --config \"$config_path\"" \
+    "cd \"$PROJECT_ROOT\" && exec $RUNNER_CMD -m $TRAIN_MODULE --config \"$config_path\"" \
     >"$log_path" 2>&1 &
   SLOT_PIDS[$slot_index]=$!
   SLOT_CONFIGS[$slot_index]="$config_name"
