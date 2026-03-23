@@ -2,6 +2,7 @@
 *.parquet
 *.csv
 *.xlsx
+*.zip
 
 # Python cache and tooling
 __pycache__/
