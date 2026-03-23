@@ -7,7 +7,7 @@ data:
   split_dir: data/splits/cp-easy_sub500000
   raw_path: data/scope_dti_with_inchikey.parquet
   graph_cache_path: data/splits/cp-easy_sub500000/graph_cache.pt
-  max_protein_length: 1024
+  max_protein_length: 1022
 
 model:
   hidden_dim: 256
@@ -50,7 +50,7 @@ training:
 
 output:
   root_dir: results
-  save_checkpoints: true
+  save_checkpoints: false
   save_every_n_epochs: 1
   allow_rerun_suffix: true
 
