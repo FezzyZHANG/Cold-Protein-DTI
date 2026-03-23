@@ -38,8 +38,10 @@ resolve_runner() {
 
 split_csv() {
   local input="$1"
-  local -n output_ref="$2"
-  IFS=',' read -r -a output_ref <<< "$input"
+  local output_var="$2"
+  local -a parsed_values=()
+  IFS=',' read -r -a parsed_values <<< "$input"
+  eval "$output_var=(\"\${parsed_values[@]}\")"
 }
 
 wait_for_slot() {
