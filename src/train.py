@@ -33,6 +33,22 @@ def _move_batch_to_device(batch: dict[str, Any], device: str) -> dict[str, Any]:
     return moved
 
 
+def _build_grad_scaler(torch_module: Any, device: str, enabled: bool) -> Any:
+    """Create an AMP GradScaler across old and new PyTorch AMP APIs."""
+    device_type = "cuda" if device.startswith("cuda") else "cpu"
+    if hasattr(torch_module, "amp") and hasattr(torch_module.amp, "GradScaler"):
+        return torch_module.amp.GradScaler(device=device_type, enabled=enabled)
+    return torch_module.cuda.amp.GradScaler(enabled=enabled)
+
+
+def _autocast_context(torch_module: Any, device: str, enabled: bool) -> Any:
+    """Create an autocast context manager across old and new PyTorch AMP APIs."""
+    device_type = "cuda" if device.startswith("cuda") else "cpu"
+    if hasattr(torch_module, "amp") and hasattr(torch_module.amp, "autocast"):
+        return torch_module.amp.autocast(device_type=device_type, enabled=enabled)
+    return torch_module.cuda.amp.autocast(enabled=enabled)
+
+
 def _evaluate_model(
     model: Any,
     loader: Any,
@@ -197,7 +213,8 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
         weight_decay=float(training_cfg["weight_decay"]),
     )
     criterion = torch.nn.BCEWithLogitsLoss()
-    scaler = torch.cuda.amp.GradScaler(enabled=bool(training_cfg["amp"]) and device.startswith("cuda"))
+    amp_enabled = bool(training_cfg["amp"]) and device.startswith("cuda")
+    scaler = _build_grad_scaler(torch, device=device, enabled=amp_enabled)
 
     best_ckpt = run_dir / "checkpoints" / "best.pt"
     latest_ckpt = run_dir / "checkpoints" / "latest.pt"
@@ -255,7 +272,7 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
                 batch = _move_batch_to_device(batch, device)
                 optimizer.zero_grad(set_to_none=True)
 
-                with torch.cuda.amp.autocast(enabled=bool(training_cfg["amp"]) and device.startswith("cuda")):
+                with _autocast_context(torch, device=device, enabled=amp_enabled):
                     outputs = model(batch)
                     loss = criterion(outputs["logits"], batch["labels"])
 
