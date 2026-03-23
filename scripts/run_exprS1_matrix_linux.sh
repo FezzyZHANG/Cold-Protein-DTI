@@ -48,7 +48,7 @@ wait_for_slot() {
   local running_count
   while true; do
     running_count=0
-    for pid in "${SLOT_PIDS[@]}"; do
+    for pid in "${SLOT_PIDS[@]-}"; do
       if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
         running_count=$((running_count + 1))
       fi
@@ -75,7 +75,7 @@ find_free_gpu_slot() {
 wait_all() {
   local status=0
   local pid
-  for pid in "${ALL_PIDS[@]}"; do
+  for pid in "${ALL_PIDS[@]-}"; do
     if [[ -n "$pid" ]]; then
       if ! wait "$pid"; then
         status=1
