@@ -11,7 +11,7 @@ import numpy as np
 
 from src.config import ConfigError, load_and_resolve_config, save_config
 from src.data.dataloader import build_dataloaders, describe_graph_cache, describe_splits
-from src.metrics import build_metrics_payload, sigmoid
+from src.metrics import build_metrics_payload
 from src.utils import (
     build_logger,
     choose_device,
@@ -136,6 +136,51 @@ def _ensure_finite_tensor(
         )
 
 
+def _validate_binary_loss_inputs(
+    torch_module: Any,
+    logits: Any,
+    labels: Any,
+    *,
+    stage: str,
+    epoch: int | None = None,
+    batch_index: int | None = None,
+) -> None:
+    """Validate BCEWithLogitsLoss inputs before computing the loss."""
+    if not bool(torch_module.is_floating_point(logits)):
+        raise TypeError(f"{stage} logits must be floating-point tensors. Received {logits.dtype}.")
+    if not bool(torch_module.is_floating_point(labels)):
+        raise TypeError(f"{stage} labels must be floating-point tensors. Received {labels.dtype}.")
+    if tuple(logits.shape) != tuple(labels.shape):
+        raise ValueError(
+            f"{stage} logits and labels must share the same shape. "
+            f"Received {tuple(logits.shape)} and {tuple(labels.shape)}."
+        )
+
+    _ensure_finite_tensor(
+        torch_module,
+        logits,
+        stage=stage,
+        quantity="logits",
+        epoch=epoch,
+        batch_index=batch_index,
+    )
+    _ensure_finite_tensor(
+        torch_module,
+        labels,
+        stage=stage,
+        quantity="labels",
+        epoch=epoch,
+        batch_index=batch_index,
+    )
+    min_label = float(labels.detach().amin().item())
+    max_label = float(labels.detach().amax().item())
+    if min_label < 0.0 or max_label > 1.0:
+        raise ValueError(
+            f"{stage} labels must stay within [0, 1] for BCEWithLogitsLoss. "
+            f"Observed min={min_label:.6f}, max={max_label:.6f}."
+        )
+
+
 def _ensure_finite_gradients(
     torch_module: Any,
     model: Any,
@@ -183,16 +228,15 @@ def _evaluate_model(
             outputs = model(batch)
             logits = outputs["logits"]
             labels = batch["labels"]
-            loss = criterion(logits, labels)
-
-            _ensure_finite_tensor(
+            _validate_binary_loss_inputs(
                 torch,
                 logits,
+                labels,
                 stage="validation",
-                quantity="logits",
                 epoch=epoch,
                 batch_index=batch_index,
             )
+            loss = criterion(logits, labels)
             loss_value = _coerce_finite_float(
                 loss.item(),
                 stage="validation",
@@ -212,13 +256,10 @@ def _evaluate_model(
 
     logits_np = np.concatenate(logits_list)
     labels_np = np.concatenate(labels_list)
-    scores_np = sigmoid(logits_np)
-    if not np.isfinite(scores_np).all():
-        raise NonFiniteValueError(stage="validation", quantity="scores", epoch=epoch)
     avg_loss = _coerce_finite_float(total_loss / max(n_batches, 1), stage="validation", quantity="avg_loss", epoch=epoch)
     return build_metrics_payload(
         labels=labels_np,
-        scores=scores_np,
+        logits=logits_np,
         group_ids=target_ids,
         threshold=threshold,
         ks=ks,
@@ -445,16 +486,19 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
                 try:
                     with _autocast_context(torch, device=device, enabled=amp_enabled):
                         outputs = model(batch)
-                        loss = criterion(outputs["logits"], batch["labels"])
+                        logits = outputs["logits"]
+                        labels = batch["labels"]
 
-                    _ensure_finite_tensor(
+                    _validate_binary_loss_inputs(
                         torch,
-                        outputs["logits"],
+                        logits,
+                        labels,
                         stage="train",
-                        quantity="logits",
                         epoch=epoch_index,
                         batch_index=batch_index,
                     )
+                    with _autocast_context(torch, device=device, enabled=amp_enabled):
+                        loss = criterion(logits, labels)
                     loss_value = _coerce_finite_float(
                         loss.item(),
                         stage="train",

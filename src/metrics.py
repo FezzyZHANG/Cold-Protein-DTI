@@ -9,7 +9,49 @@ import numpy as np
 
 
 def sigmoid(logits: np.ndarray) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-logits))
+    """Compute sigmoid in float64 with a branch that avoids exp overflow."""
+    logits_array = np.asarray(logits, dtype=np.float64)
+    positive_mask = logits_array >= 0.0
+    output = np.empty_like(logits_array, dtype=np.float64)
+    output[positive_mask] = 1.0 / (1.0 + np.exp(-logits_array[positive_mask]))
+
+    negative_logits = logits_array[~positive_mask]
+    exp_logits = np.exp(negative_logits)
+    output[~positive_mask] = exp_logits / (1.0 + exp_logits)
+    return output
+
+
+def _flatten_finite_array(values: np.ndarray, *, name: str) -> np.ndarray:
+    array = np.ravel(np.asarray(values))
+    if array.size == 0:
+        raise ValueError(f"{name} must contain at least one value.")
+    if not np.isfinite(array).all():
+        raise ValueError(f"{name} contains NaN or Inf values.")
+    return array
+
+
+def _prepare_binary_labels(labels: np.ndarray) -> np.ndarray:
+    label_array = _flatten_finite_array(labels, name="labels").astype(np.float64, copy=False)
+    if np.any((label_array < 0.0) | (label_array > 1.0)):
+        raise ValueError("Binary labels must stay within [0, 1].")
+    if not np.all(np.isclose(label_array, np.round(label_array))):
+        raise ValueError("Metrics require binary labels encoded as 0/1 values.")
+    return np.round(label_array).astype(np.int64, copy=False)
+
+
+def _prepare_scores(scores: np.ndarray) -> np.ndarray:
+    score_array = _flatten_finite_array(scores, name="scores").astype(np.float64, copy=False)
+    if np.any((score_array < 0.0) | (score_array > 1.0)):
+        raise ValueError("Probability scores must stay within [0, 1].")
+    return score_array
+
+
+def _resolve_scores(*, logits: np.ndarray | None, scores: np.ndarray | None) -> np.ndarray:
+    if (logits is None) == (scores is None):
+        raise ValueError("Provide exactly one of logits or scores when building metrics.")
+    if logits is not None:
+        return sigmoid(_flatten_finite_array(logits, name="logits"))
+    return _prepare_scores(scores)
 
 
 def _safe_divide(numerator: float, denominator: float) -> float | None:
@@ -24,8 +66,15 @@ def binary_classification_metrics(
     threshold: float = 0.5,
 ) -> dict[str, float | None]:
     """Compute conservative binary metrics without requiring scikit-learn."""
-    y_true = labels.astype(np.int64)
-    y_score = scores.astype(np.float64)
+    if threshold < 0.0 or threshold > 1.0:
+        raise ValueError(f"Binary classification threshold must stay within [0, 1]. Received {threshold}.")
+    y_true = _prepare_binary_labels(labels)
+    y_score = _prepare_scores(scores)
+    if y_true.shape != y_score.shape:
+        raise ValueError(
+            "Labels and scores must have the same flattened shape. "
+            f"Received {y_true.shape} and {y_score.shape}."
+        )
     y_pred = (y_score >= threshold).astype(np.int64)
 
     tp = int(np.sum((y_true == 1) & (y_pred == 1)))
@@ -140,16 +189,29 @@ def ranking_metrics(
     ef_fractions: list[float],
 ) -> dict[str, Any]:
     """Compute pooled and per-target macro ranking metrics."""
-    pooled = _ranking_metrics_for_group(labels=labels, scores=scores, ks=ks, ef_fractions=ef_fractions)
+    y_true = _prepare_binary_labels(labels)
+    y_score = _prepare_scores(scores)
+    if y_true.shape != y_score.shape:
+        raise ValueError(
+            "Labels and scores must have the same flattened shape. "
+            f"Received {y_true.shape} and {y_score.shape}."
+        )
+    if y_true.shape[0] != len(group_ids):
+        raise ValueError(
+            "group_ids must align one-to-one with labels and scores. "
+            f"Received {len(group_ids)} group ids for {y_true.shape[0]} examples."
+        )
+
+    pooled = _ranking_metrics_for_group(labels=y_true, scores=y_score, ks=ks, ef_fractions=ef_fractions)
 
     per_target: list[dict[str, float | None]] = []
     unique_groups = sorted(set(group_ids))
     for group_id in unique_groups:
         mask = np.asarray([current == group_id for current in group_ids], dtype=bool)
-        group_labels = labels[mask]
+        group_labels = y_true[mask]
         if len(group_labels) == 0 or np.sum(group_labels) == 0:
             continue
-        group_scores = scores[mask]
+        group_scores = y_score[mask]
         per_target.append(_ranking_metrics_for_group(group_labels, group_scores, ks, ef_fractions))
 
     return {
@@ -161,15 +223,24 @@ def ranking_metrics(
 
 def build_metrics_payload(
     labels: np.ndarray,
-    scores: np.ndarray,
     group_ids: list[str],
     threshold: float,
     ks: list[int],
     ef_fractions: list[float],
+    logits: np.ndarray | None = None,
+    scores: np.ndarray | None = None,
     loss: float | None = None,
 ) -> dict[str, Any]:
-    classification = binary_classification_metrics(labels=labels, scores=scores, threshold=threshold)
-    ranking = ranking_metrics(labels=labels, scores=scores, group_ids=group_ids, ks=ks, ef_fractions=ef_fractions)
+    """Build metric payloads from binary labels and either logits or probabilities."""
+    y_true = _prepare_binary_labels(labels)
+    y_score = _resolve_scores(logits=logits, scores=scores)
+    if y_true.shape != y_score.shape:
+        raise ValueError(
+            "Labels and model outputs must have the same flattened shape. "
+            f"Received {y_true.shape} and {y_score.shape}."
+        )
+    classification = binary_classification_metrics(labels=y_true, scores=y_score, threshold=threshold)
+    ranking = ranking_metrics(labels=y_true, scores=y_score, group_ids=group_ids, ks=ks, ef_fractions=ef_fractions)
 
     payload: dict[str, Any] = {
         "classification": classification,
@@ -178,4 +249,3 @@ def build_metrics_payload(
     if loss is not None:
         payload["loss"] = float(loss)
     return payload
-

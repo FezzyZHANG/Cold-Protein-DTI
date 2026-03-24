@@ -6,9 +6,11 @@ import argparse
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from src.config import ConfigError, load_and_resolve_config, save_config
 from src.data.dataloader import build_dataloaders, describe_graph_cache, describe_splits
-from src.metrics import build_metrics_payload, sigmoid
+from src.metrics import build_metrics_payload
 from src.utils import (
     build_logger,
     choose_device,
@@ -29,6 +31,31 @@ def _move_batch_to_device(batch: dict[str, Any], device: str) -> dict[str, Any]:
         else:
             moved[key] = value
     return moved
+
+
+def _validate_binary_loss_inputs(torch_module: Any, logits: Any, labels: Any, *, stage: str) -> None:
+    """Validate BCEWithLogitsLoss inputs before computing evaluation loss."""
+    if not bool(torch_module.is_floating_point(logits)):
+        raise TypeError(f"{stage} logits must be floating-point tensors. Received {logits.dtype}.")
+    if not bool(torch_module.is_floating_point(labels)):
+        raise TypeError(f"{stage} labels must be floating-point tensors. Received {labels.dtype}.")
+    if tuple(logits.shape) != tuple(labels.shape):
+        raise ValueError(
+            f"{stage} logits and labels must share the same shape. "
+            f"Received {tuple(logits.shape)} and {tuple(labels.shape)}."
+        )
+    if not bool(torch_module.isfinite(logits).all().item()):
+        raise ValueError(f"{stage} logits contain NaN or Inf values.")
+    if not bool(torch_module.isfinite(labels).all().item()):
+        raise ValueError(f"{stage} labels contain NaN or Inf values.")
+
+    min_label = float(labels.detach().amin().item())
+    max_label = float(labels.detach().amax().item())
+    if min_label < 0.0 or max_label > 1.0:
+        raise ValueError(
+            f"{stage} labels must stay within [0, 1] for BCEWithLogitsLoss. "
+            f"Observed min={min_label:.6f}, max={max_label:.6f}."
+        )
 
 
 def _resolve_checkpoint_path(run_dir: Path, explicit_checkpoint: str | None) -> Path:
@@ -115,7 +142,6 @@ def run_evaluation(config: dict[str, Any], checkpoint_path: str | None, dry_run:
 
     torch = try_import_torch()
     from src.model.dti_model import build_model
-    import numpy as np
 
     device = choose_device(str(config["training"]["device"]), torch)
     model = build_model(config).to(device)
@@ -142,6 +168,7 @@ def run_evaluation(config: dict[str, Any], checkpoint_path: str | None, dry_run:
             outputs = model(batch)
             logits = outputs["logits"]
             labels = batch["labels"]
+            _validate_binary_loss_inputs(torch, logits, labels, stage="eval")
             loss = criterion(logits, labels)
 
             total_loss += float(loss.item())
@@ -155,10 +182,9 @@ def run_evaluation(config: dict[str, Any], checkpoint_path: str | None, dry_run:
 
     logits_np = np.concatenate(logits_list)
     labels_np = np.concatenate(labels_list)
-    scores_np = sigmoid(logits_np)
     metrics_payload = build_metrics_payload(
         labels=labels_np,
-        scores=scores_np,
+        logits=logits_np,
         group_ids=target_ids,
         threshold=float(config["metrics"]["threshold"]),
         ks=[int(item) for item in config["metrics"]["ks"]],
