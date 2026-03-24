@@ -174,18 +174,25 @@ def build_dataloaders(config: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
         )
         for name in filtered_frames
     }
+    batch_size = int(training_cfg["batch_size"])
+    undersized_splits = [name for name, dataset in datasets.items() if len(dataset) < batch_size]
+    if undersized_splits:
+        raise RuntimeError(
+            "drop_last=True requires every split to contain at least one full batch. "
+            f"batch_size={batch_size}, undersized_splits={undersized_splits}."
+        )
 
     common_loader_kwargs = {
-        "batch_size": int(training_cfg["batch_size"]),
+        "batch_size": batch_size,
         "num_workers": int(training_cfg["num_workers"]),
         "collate_fn": collate_dti_batch,
         "pin_memory": str(training_cfg["device"]).startswith("cuda"),
     }
 
     loaders = {
-        "train": DataLoader(datasets["train"], shuffle=True, **common_loader_kwargs),
-        "val": DataLoader(datasets["val"], shuffle=False, **common_loader_kwargs),
-        "test": DataLoader(datasets["test"], shuffle=False, **common_loader_kwargs),
+        "train": DataLoader(datasets["train"], shuffle=True, drop_last=True, **common_loader_kwargs),
+        "val": DataLoader(datasets["val"], shuffle=False, drop_last=True, **common_loader_kwargs),
+        "test": DataLoader(datasets["test"], shuffle=False, drop_last=True, **common_loader_kwargs),
     }
 
     metadata = {

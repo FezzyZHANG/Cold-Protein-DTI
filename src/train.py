@@ -72,6 +72,10 @@ class NonFiniteValueError(RuntimeError):
         return payload
 
 
+class BatchValidationError(ValueError):
+    """Raised when a batch fails explicit BCE/logit/label validation checks."""
+
+
 def _move_batch_to_device(batch: dict[str, Any], device: str) -> dict[str, Any]:
     moved: dict[str, Any] = {}
     for key, value in batch.items():
@@ -147,11 +151,11 @@ def _validate_binary_loss_inputs(
 ) -> None:
     """Validate BCEWithLogitsLoss inputs before computing the loss."""
     if not bool(torch_module.is_floating_point(logits)):
-        raise TypeError(f"{stage} logits must be floating-point tensors. Received {logits.dtype}.")
+        raise BatchValidationError(f"{stage} logits must be floating-point tensors. Received {logits.dtype}.")
     if not bool(torch_module.is_floating_point(labels)):
-        raise TypeError(f"{stage} labels must be floating-point tensors. Received {labels.dtype}.")
+        raise BatchValidationError(f"{stage} labels must be floating-point tensors. Received {labels.dtype}.")
     if tuple(logits.shape) != tuple(labels.shape):
-        raise ValueError(
+        raise BatchValidationError(
             f"{stage} logits and labels must share the same shape. "
             f"Received {tuple(logits.shape)} and {tuple(labels.shape)}."
         )
@@ -175,10 +179,17 @@ def _validate_binary_loss_inputs(
     min_label = float(labels.detach().amin().item())
     max_label = float(labels.detach().amax().item())
     if min_label < 0.0 or max_label > 1.0:
-        raise ValueError(
+        raise BatchValidationError(
             f"{stage} labels must stay within [0, 1] for BCEWithLogitsLoss. "
             f"Observed min={min_label:.6f}, max={max_label:.6f}."
         )
+
+
+def _skippable_batch_error_fields(exc: Exception) -> tuple[str, float | None, str]:
+    """Normalize skippable batch errors for logging and metrics payloads."""
+    if isinstance(exc, NonFiniteValueError):
+        return exc.quantity, exc.value, str(exc)
+    return "value_error", None, str(exc)
 
 
 def _ensure_finite_gradients(
@@ -208,6 +219,9 @@ def _evaluate_model(
     threshold: float,
     ks: list[int],
     ef_fractions: list[float],
+    logger: Any | None = None,
+    stage: str = "validation",
+    max_consecutive_bad_batches: int = 5,
     epoch: int | None = None,
     max_batches: int | None = None,
 ) -> dict[str, Any]:
@@ -219,44 +233,74 @@ def _evaluate_model(
     target_ids: list[str] = []
     total_loss = 0.0
     n_batches = 0
+    skipped_bad_batches = 0
+    consecutive_bad_batches = 0
 
     with torch.no_grad():
         for batch_index, batch in enumerate(loader):
             if max_batches is not None and batch_index >= max_batches:
                 break
-            batch = _move_batch_to_device(batch, device)
-            outputs = model(batch)
-            logits = outputs["logits"]
-            labels = batch["labels"]
-            _validate_binary_loss_inputs(
-                torch,
-                logits,
-                labels,
-                stage="validation",
-                epoch=epoch,
-                batch_index=batch_index,
-            )
-            loss = criterion(logits, labels)
-            loss_value = _coerce_finite_float(
-                loss.item(),
-                stage="validation",
-                quantity="loss",
-                epoch=epoch,
-                batch_index=batch_index,
-            )
+            try:
+                batch = _move_batch_to_device(batch, device)
+                outputs = model(batch)
+                logits = outputs["logits"]
+                labels = batch["labels"]
+                _validate_binary_loss_inputs(
+                    torch,
+                    logits,
+                    labels,
+                    stage=stage,
+                    epoch=epoch,
+                    batch_index=batch_index,
+                )
+                loss = criterion(logits, labels)
+                loss_value = _coerce_finite_float(
+                    loss.item(),
+                    stage=stage,
+                    quantity="loss",
+                    epoch=epoch,
+                    batch_index=batch_index,
+                )
 
-            total_loss += loss_value
-            n_batches += 1
-            logits_list.append(logits.detach().cpu().numpy())
-            labels_list.append(labels.detach().cpu().numpy())
-            target_ids.extend(batch["target_uniprot_ids"])
+                total_loss += loss_value
+                n_batches += 1
+                consecutive_bad_batches = 0
+                logits_list.append(logits.detach().cpu().numpy())
+                labels_list.append(labels.detach().cpu().numpy())
+                target_ids.extend(batch["target_uniprot_ids"])
+            except (NonFiniteValueError, BatchValidationError) as exc:
+                skipped_bad_batches += 1
+                consecutive_bad_batches += 1
+                quantity, _, message = _skippable_batch_error_fields(exc)
+                if logger is not None:
+                    logger.warning(
+                        "Skipping bad %s batch at epoch %s batch %s due to %s (consecutive=%s/%s): %s",
+                        stage,
+                        epoch,
+                        batch_index,
+                        quantity,
+                        consecutive_bad_batches,
+                        max_consecutive_bad_batches,
+                        message,
+                    )
+                if consecutive_bad_batches >= max_consecutive_bad_batches:
+                    raise NonFiniteValueError(
+                        stage=stage,
+                        quantity="consecutive_bad_batches",
+                        value=float(consecutive_bad_batches),
+                        epoch=epoch,
+                        batch_index=batch_index,
+                    ) from exc
+                continue
 
     if not logits_list:
-        raise RuntimeError("Evaluation loader produced zero batches.")
+        raise NonFiniteValueError(stage=stage, quantity="all_batches_skipped", epoch=epoch)
 
     logits_np = np.concatenate(logits_list)
     labels_np = np.concatenate(labels_list)
-    avg_loss = _coerce_finite_float(total_loss / max(n_batches, 1), stage="validation", quantity="avg_loss", epoch=epoch)
+    avg_loss = _coerce_finite_float(total_loss / max(n_batches, 1), stage=stage, quantity="avg_loss", epoch=epoch)
+    if skipped_bad_batches > 0 and logger is not None:
+        logger.warning("Skipped %s bad %s batches while computing metrics.", skipped_bad_batches, stage)
     return build_metrics_payload(
         labels=labels_np,
         logits=logits_np,
@@ -527,7 +571,7 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
                     epoch_loss += loss_value
                     batch_count += 1
                     consecutive_bad_batches *= 0.95  # Decay consecutive bad batch count to allow recovery over time
-                except NonFiniteValueError as exc:
+                except (NonFiniteValueError, BatchValidationError) as exc:
                     optimizer.zero_grad(set_to_none=True)
                     if amp_enabled and gradients_unscaled:
                         scaler.update()
@@ -535,22 +579,25 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
                     skipped_bad_batches_epoch += 1
                     consecutive_bad_batches += 1
                     max_consecutive_bad_batches_seen = max(max_consecutive_bad_batches_seen, consecutive_bad_batches)
+                    quantity, observed_value, message = _skippable_batch_error_fields(exc)
                     if len(skipped_bad_batch_examples) < 10:
                         skipped_bad_batch_examples.append(
                             {
                                 "epoch": epoch_index,
                                 "batch_index": batch_index,
-                                "quantity": exc.quantity,
-                                "observed_value": exc.value,
+                                "quantity": quantity,
+                                "observed_value": observed_value,
+                                "message": message,
                             }
                         )
                     logger.warning(
-                        "Skipping bad training batch at epoch %s batch %s due to %s (consecutive=%s/%s)",
+                        "Skipping bad training batch at epoch %s batch %s due to %s (consecutive=%s/%s): %s",
                         epoch_index,
                         batch_index,
-                        exc.quantity,
+                        quantity,
                         consecutive_bad_batches,
                         max_consecutive_bad_batches,
+                        message,
                     )
                     if consecutive_bad_batches >= max_consecutive_bad_batches:
                         raise NonFiniteValueError(
@@ -575,6 +622,9 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
                 threshold=float(config["metrics"]["threshold"]),
                 ks=[int(item) for item in config["metrics"]["ks"]],
                 ef_fractions=[float(item) for item in config["metrics"]["ef_fractions"]],
+                logger=logger,
+                stage="validation",
+                max_consecutive_bad_batches=max_consecutive_bad_batches,
                 epoch=epoch_index,
                 max_batches=max_eval_batches,
             )
@@ -656,6 +706,9 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
             threshold=float(config["metrics"]["threshold"]),
             ks=[int(item) for item in config["metrics"]["ks"]],
             ef_fractions=[float(item) for item in config["metrics"]["ef_fractions"]],
+            logger=logger,
+            stage="test",
+            max_consecutive_bad_batches=max_consecutive_bad_batches,
             max_batches=max_eval_batches,
         )
 
@@ -719,6 +772,9 @@ def run_training(config: dict[str, Any], dry_run: bool, max_steps: int | None = 
                 threshold=float(config["metrics"]["threshold"]),
                 ks=[int(item) for item in config["metrics"]["ks"]],
                 ef_fractions=[float(item) for item in config["metrics"]["ef_fractions"]],
+                logger=logger,
+                stage="test",
+                max_consecutive_bad_batches=max_consecutive_bad_batches,
                 max_batches=max_eval_batches,
             )
             status = "completed_with_non_finite_stop"

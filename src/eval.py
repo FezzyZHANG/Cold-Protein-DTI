@@ -33,26 +33,30 @@ def _move_batch_to_device(batch: dict[str, Any], device: str) -> dict[str, Any]:
     return moved
 
 
+class BatchValidationError(ValueError):
+    """Raised when a batch fails explicit BCE/logit/label validation checks."""
+
+
 def _validate_binary_loss_inputs(torch_module: Any, logits: Any, labels: Any, *, stage: str) -> None:
     """Validate BCEWithLogitsLoss inputs before computing evaluation loss."""
     if not bool(torch_module.is_floating_point(logits)):
-        raise TypeError(f"{stage} logits must be floating-point tensors. Received {logits.dtype}.")
+        raise BatchValidationError(f"{stage} logits must be floating-point tensors. Received {logits.dtype}.")
     if not bool(torch_module.is_floating_point(labels)):
-        raise TypeError(f"{stage} labels must be floating-point tensors. Received {labels.dtype}.")
+        raise BatchValidationError(f"{stage} labels must be floating-point tensors. Received {labels.dtype}.")
     if tuple(logits.shape) != tuple(labels.shape):
-        raise ValueError(
+        raise BatchValidationError(
             f"{stage} logits and labels must share the same shape. "
             f"Received {tuple(logits.shape)} and {tuple(labels.shape)}."
         )
     if not bool(torch_module.isfinite(logits).all().item()):
-        raise ValueError(f"{stage} logits contain NaN or Inf values.")
+        raise BatchValidationError(f"{stage} logits contain NaN or Inf values.")
     if not bool(torch_module.isfinite(labels).all().item()):
-        raise ValueError(f"{stage} labels contain NaN or Inf values.")
+        raise BatchValidationError(f"{stage} labels contain NaN or Inf values.")
 
     min_label = float(labels.detach().amin().item())
     max_label = float(labels.detach().amax().item())
     if min_label < 0.0 or max_label > 1.0:
-        raise ValueError(
+        raise BatchValidationError(
             f"{stage} labels must stay within [0, 1] for BCEWithLogitsLoss. "
             f"Observed min={min_label:.6f}, max={max_label:.6f}."
         )
@@ -158,27 +162,48 @@ def run_evaluation(config: dict[str, Any], checkpoint_path: str | None, dry_run:
     n_batches = 0
     max_eval_batches = config["training"]["max_eval_batches"]
     max_eval_batches = int(max_eval_batches) if max_eval_batches is not None else None
+    max_consecutive_bad_batches = max(5, int(config["training"]["max_consecutive_bad_batches"]))
+    skipped_bad_batches = 0
+    consecutive_bad_batches = 0
 
     model.eval()
     with torch.no_grad():
         for batch_index, batch in enumerate(loaders["test"]):
             if max_eval_batches is not None and batch_index >= max_eval_batches:
                 break
-            batch = _move_batch_to_device(batch, device)
-            outputs = model(batch)
-            logits = outputs["logits"]
-            labels = batch["labels"]
-            _validate_binary_loss_inputs(torch, logits, labels, stage="eval")
-            loss = criterion(logits, labels)
+            try:
+                batch = _move_batch_to_device(batch, device)
+                outputs = model(batch)
+                logits = outputs["logits"]
+                labels = batch["labels"]
+                _validate_binary_loss_inputs(torch, logits, labels, stage="eval")
+                loss = criterion(logits, labels)
 
-            total_loss += float(loss.item())
-            n_batches += 1
-            logits_list.append(logits.detach().cpu().numpy())
-            labels_list.append(labels.detach().cpu().numpy())
-            target_ids.extend(batch["target_uniprot_ids"])
+                total_loss += float(loss.item())
+                n_batches += 1
+                consecutive_bad_batches = 0
+                logits_list.append(logits.detach().cpu().numpy())
+                labels_list.append(labels.detach().cpu().numpy())
+                target_ids.extend(batch["target_uniprot_ids"])
+            except BatchValidationError as exc:
+                skipped_bad_batches += 1
+                consecutive_bad_batches += 1
+                logger.warning(
+                    "Skipping bad eval batch %s due to value_error (consecutive=%s/%s): %s",
+                    batch_index,
+                    consecutive_bad_batches,
+                    max_consecutive_bad_batches,
+                    exc,
+                )
+                if consecutive_bad_batches >= max_consecutive_bad_batches:
+                    raise ValueError(
+                        "Encountered too many consecutive invalid evaluation batches. "
+                        f"Stopped after {consecutive_bad_batches} bad batches."
+                    ) from exc
+                continue
 
     if not logits_list:
-        raise RuntimeError("Evaluation loader produced zero batches.")
+        raise RuntimeError("Evaluation loader produced zero usable batches after skipping invalid batches.")
 
     logits_np = np.concatenate(logits_list)
     labels_np = np.concatenate(labels_list)
@@ -191,6 +216,8 @@ def run_evaluation(config: dict[str, Any], checkpoint_path: str | None, dry_run:
         ef_fractions=[float(item) for item in config["metrics"]["ef_fractions"]],
         loss=total_loss / max(n_batches, 1),
     )
+    if skipped_bad_batches > 0:
+        logger.warning("Skipped %s bad eval batches while computing metrics.", skipped_bad_batches)
 
     write_evaluation_artifacts(
         config=config,
