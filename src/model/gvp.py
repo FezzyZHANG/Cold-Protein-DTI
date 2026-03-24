@@ -8,6 +8,8 @@ import torch
 from torch import nn
 from torch_geometric.nn import MessagePassing
 
+from src.model.common import init_layer_norm, init_linear
+
 
 ScalarVector = tuple[torch.Tensor, torch.Tensor]
 
@@ -70,6 +72,12 @@ class GVPLayerNorm(nn.Module):
         self.scalar_norm = nn.LayerNorm(scalar_dim)
         self.vector_dim = int(vector_dim)
         self.vector_scale = nn.Parameter(torch.ones(self.vector_dim)) if self.vector_dim > 0 else None
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        init_layer_norm(self.scalar_norm)
+        if self.vector_scale is not None:
+            nn.init.ones_(self.vector_scale)
 
     def forward(self, item: ScalarVector) -> ScalarVector:
         scalar, vector = item
@@ -114,6 +122,16 @@ class GVP(nn.Module):
             self.wv = None
 
         self.wg = nn.Linear(self.so, self.vo) if self.vo > 0 and self.vector_gate else None
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        if self.wh is not None:
+            init_linear(self.wh)
+        init_linear(self.ws)
+        if self.wv is not None:
+            init_linear(self.wv)
+        if self.wg is not None:
+            init_linear(self.wg)
 
     def forward(self, item: ScalarVector) -> ScalarVector:
         scalar, vector = item
@@ -220,4 +238,3 @@ class GVPConvLayer(nn.Module):
         ff_update = self.ff_second(self.ff_first(node_state))
         node_state = self.norm_second(tuple_sum(node_state, self.dropout_second(ff_update)))
         return node_state
-

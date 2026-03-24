@@ -9,6 +9,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from src.model.esm_support import load_esm_backbone
+from src.model.common import init_batch_norm, init_conv1d, init_embedding, init_linear
 
 
 def _lengths_to_mask(lengths: torch.Tensor, max_length: int) -> torch.Tensor:
@@ -45,6 +46,14 @@ class CNNProteinEncoder(nn.Module):
             in_channels = hidden_dim
         self.dropout = nn.Dropout(dropout)
         self.output_dim = hidden_dim
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        init_embedding(self.embedding)
+        for conv in self.convs:
+            init_conv1d(conv)
+        for batch_norm in self.batch_norms:
+            init_batch_norm(batch_norm)
 
     def forward(self, batch: dict[str, torch.Tensor | list[str]]) -> dict[str, torch.Tensor]:
         token_ids = batch["protein_tokens"]
@@ -126,6 +135,10 @@ class ESMProteinEncoder(nn.Module):
             for layer in self._get_encoder_layers()[: self.freeze_n_layers]:
                 self._freeze_module(layer)
                 self._modules_kept_in_eval.append(layer)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        init_linear(self.output_proj)
 
     @staticmethod
     def _freeze_module(module: nn.Module) -> None:

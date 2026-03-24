@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from torch.nn.utils.weight_norm import weight_norm
 
-from src.model.common import masked_mean
+from src.model.common import activation_gain, init_batch_norm, init_linear, masked_mean
 
 
 def _require_rank(tensor: torch.Tensor, rank: int, name: str) -> torch.Tensor:
@@ -50,22 +50,31 @@ def _disabled_autocast_context(device_type: str) -> torch.amp.autocast_mode.auto
     return nullcontext()
 
 
+def _make_weight_norm_linear(in_dim: int, out_dim: int, *, gain: float = 1.0, bias: bool = True) -> nn.Linear:
+    """Create a weight-normalized linear layer with explicit initialization."""
+
+    linear = nn.Linear(int(in_dim), int(out_dim), bias=bias)
+    init_linear(linear, gain=gain)
+    return weight_norm(linear, dim=None)
+
+
 class FCNet(nn.Module):
     """Simple non-linear fully connected network from the BAN reference implementation."""
 
     def __init__(self, dims: list[int], act: str = "ReLU", dropout: float = 0.0) -> None:
         super().__init__()
+        gain = activation_gain(act)
         layers: list[nn.Module] = []
         for index in range(len(dims) - 2):
             in_dim = int(dims[index])
             out_dim = int(dims[index + 1])
-            layers.append(weight_norm(nn.Linear(in_dim, out_dim), dim=None))
+            layers.append(_make_weight_norm_linear(in_dim, out_dim, gain=gain))
             if act:
                 layers.append(getattr(nn, act)())
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
 
-        layers.append(weight_norm(nn.Linear(int(dims[-2]), int(dims[-1])), dim=None))
+        layers.append(_make_weight_norm_linear(int(dims[-2]), int(dims[-1]), gain=gain))
         if act:
             layers.append(getattr(nn, act)())
         if dropout > 0:
@@ -103,12 +112,19 @@ class BANLayer(nn.Module):
             self.p_net = nn.AvgPool1d(self.k, stride=self.k)
 
         if self.h_out <= self.c:
-            self.h_mat = nn.Parameter(torch.Tensor(1, self.h_out, 1, self.h_dim * self.k).normal_())
-            self.h_bias = nn.Parameter(torch.Tensor(1, self.h_out, 1, 1).normal_())
+            self.h_mat = nn.Parameter(torch.empty(1, self.h_out, 1, self.h_dim * self.k))
+            self.h_bias = nn.Parameter(torch.empty(1, self.h_out, 1, 1))
         else:
-            self.h_net = weight_norm(nn.Linear(self.h_dim * self.k, self.h_out), dim=None)
+            self.h_net = _make_weight_norm_linear(self.h_dim * self.k, self.h_out)
 
         self.bn = nn.BatchNorm1d(self.h_dim)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        if hasattr(self, "h_mat"):
+            nn.init.xavier_uniform_(self.h_mat)
+            nn.init.zeros_(self.h_bias)
+        init_batch_norm(self.bn)
 
     def attention_pooling(self, v: torch.Tensor, q: torch.Tensor, att_map: torch.Tensor) -> torch.Tensor:
         fusion_logits = torch.einsum("bvk,bvq,bqk->bk", v, att_map, q)
@@ -161,6 +177,17 @@ class MLPDecoder(nn.Module):
         self.fc3 = nn.Linear(hidden_dim, out_dim)
         self.bn3 = nn.BatchNorm1d(out_dim)
         self.fc4 = nn.Linear(out_dim, binary)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        relu_gain = activation_gain("relu")
+        init_linear(self.fc1, gain=relu_gain)
+        init_batch_norm(self.bn1)
+        init_linear(self.fc2, gain=relu_gain)
+        init_batch_norm(self.bn2)
+        init_linear(self.fc3, gain=relu_gain)
+        init_batch_norm(self.bn3)
+        init_linear(self.fc4)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         outputs = self.bn1(torch.relu(self.fc1(inputs)))
@@ -180,6 +207,12 @@ class ConcatFusion(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        gelu_gain = activation_gain("gelu")
+        init_linear(self.classifier[0], gain=gelu_gain)
+        init_linear(self.classifier[3])
 
     def forward(self, drug_output: dict[str, torch.Tensor], protein_output: dict[str, torch.Tensor]) -> torch.Tensor:
         drug_pooled = _pooled_features(drug_output, "drug")
