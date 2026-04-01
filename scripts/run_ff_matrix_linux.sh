@@ -47,11 +47,10 @@ split_csv() {
 }
 
 shell_quote_args() {
-  local -n source_args="$1"
   local -a quoted=()
   local arg
 
-  for arg in "${source_args[@]}"; do
+  for arg in "$@"; do
     quoted+=("$(printf '%q' "$arg")")
   done
 
@@ -196,7 +195,7 @@ mkdir -p "$LOG_ROOT"
 
 RUNNER_CMD="$(resolve_runner)"
 split_csv "$GPU_IDS" GPU_LIST
-TRAIN_ARGS_SHELL="$(shell_quote_args TRAIN_ARGS)"
+TRAIN_ARGS_SHELL="$(shell_quote_args "${TRAIN_ARGS[@]}")"
 
 if [[ "${#GPU_LIST[@]}" -eq 0 ]]; then
   echo "[ff] GPU_IDS must list at least one CUDA device." >&2
