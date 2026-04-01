@@ -4,56 +4,33 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_GLOB="${CONFIG_GLOB:-$PROJECT_ROOT/config/ff/*.yaml}"
 LOG_ROOT="${LOG_ROOT:-$PROJECT_ROOT/logs/ff}"
+STATE_ROOT="${STATE_ROOT:-$LOG_ROOT/.run_ff_matrix_linux}"
 GPU_IDS="${GPU_IDS:-0,1,2,3}"
 TRAIN_MODULE="${TRAIN_MODULE:-src.train}"
 UV_SYNC_EXTRAS="${UV_SYNC_EXTRAS:---extra train --extra esm}"
 INTERRUPTED=0
 TRAIN_ARGS=("$@")
 
-resolve_runner() {
-  if [[ -n "${RUNNER:-}" ]]; then
-    printf '%s\n' "$RUNNER"
-    return
-  fi
+declare -a GPU_LIST=()
+declare -a CONFIGS=()
+declare -a RUNNER_CMD=()
+declare -a UV_SYNC_EXTRA_ARGS=()
+declare -a SLOT_PIDS=()
+declare -a SLOT_CONFIGS=()
+declare -a SLOT_STATUS_FILES=()
+RUNNER_LABEL=""
+RUN_STATUS=0
+LAUNCH_PID=""
 
-  if [[ -x "$PROJECT_ROOT/.venv/bin/python" ]]; then
-    printf '%s\n' "$PROJECT_ROOT/.venv/bin/python"
-    return
-  fi
+trim_whitespace() {
+  local value="$1"
 
-  if command -v uv >/dev/null 2>&1; then
-    printf 'uv run %s python\n' "$UV_SYNC_EXTRAS"
-    return
-  fi
-
-  for candidate in python3 python; do
-    if command -v "$candidate" >/dev/null 2>&1; then
-      printf '%s\n' "$candidate"
-      return
-    fi
-  done
-
-  echo "[ff] could not find a usable Python runner." >&2
-  echo "[ff] create the environment with: uv sync --extra train --extra esm" >&2
-  exit 1
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s\n' "$value"
 }
 
-split_csv() {
-  local input="$1"
-  local output_var="$2"
-  local -a parsed_values=()
-  if [[ -n "$input" ]]; then
-    IFS=',' read -r -a parsed_values <<< "$input"
-  fi
-
-  if [[ "${#parsed_values[@]}" -gt 0 ]]; then
-    eval "$output_var=(\"\${parsed_values[@]}\")"
-  else
-    eval "$output_var=()"
-  fi
-}
-
-shell_quote_args() {
+join_shell_words() {
   local -a quoted=()
   local arg
 
@@ -64,17 +41,118 @@ shell_quote_args() {
   printf '%s' "${quoted[*]:-}"
 }
 
+parse_gpu_ids() {
+  local -a raw_values=()
+  local value
+  local trimmed
+
+  GPU_LIST=()
+  if [[ -z "$GPU_IDS" ]]; then
+    return
+  fi
+
+  IFS=',' read -r -a raw_values <<< "$GPU_IDS"
+  for value in "${raw_values[@]}"; do
+    trimmed="$(trim_whitespace "$value")"
+    if [[ -n "$trimmed" ]]; then
+      GPU_LIST+=("$trimmed")
+    fi
+  done
+}
+
+parse_uv_sync_extras() {
+  UV_SYNC_EXTRA_ARGS=()
+  if [[ -n "$UV_SYNC_EXTRAS" ]]; then
+    read -r -a UV_SYNC_EXTRA_ARGS <<< "$UV_SYNC_EXTRAS"
+  fi
+}
+
+prepare_runner() {
+  local candidate
+
+  parse_uv_sync_extras
+
+  if [[ -n "${RUNNER:-}" ]]; then
+    read -r -a RUNNER_CMD <<< "$RUNNER"
+    if [[ "${#RUNNER_CMD[@]}" -eq 0 ]]; then
+      echo "[ff] RUNNER was provided but did not contain an executable." >&2
+      exit 1
+    fi
+    RUNNER_LABEL="$(join_shell_words "${RUNNER_CMD[@]}")"
+    return
+  fi
+
+  if [[ -x "$PROJECT_ROOT/.venv/bin/python" ]]; then
+    RUNNER_CMD=("$PROJECT_ROOT/.venv/bin/python")
+    RUNNER_LABEL="$(join_shell_words "${RUNNER_CMD[@]}")"
+    return
+  fi
+
+  if command -v uv >/dev/null 2>&1; then
+    echo "[ff] .venv/bin/python not found. Preparing environment with uv sync ${UV_SYNC_EXTRAS}" >&2
+    uv sync "${UV_SYNC_EXTRA_ARGS[@]}"
+
+    if [[ -x "$PROJECT_ROOT/.venv/bin/python" ]]; then
+      RUNNER_CMD=("$PROJECT_ROOT/.venv/bin/python")
+      RUNNER_LABEL="$(join_shell_words "${RUNNER_CMD[@]}")"
+      return
+    fi
+
+    RUNNER_CMD=(uv run --no-sync "${UV_SYNC_EXTRA_ARGS[@]}" python)
+    RUNNER_LABEL="$(join_shell_words "${RUNNER_CMD[@]}")"
+    return
+  fi
+
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      RUNNER_CMD=("$candidate")
+      RUNNER_LABEL="$(join_shell_words "${RUNNER_CMD[@]}")"
+      echo "[ff] using fallback runner: $candidate" >&2
+      return
+    fi
+  done
+
+  echo "[ff] could not find a usable Python runner." >&2
+  echo "[ff] create the environment with: uv sync --extra train --extra esm" >&2
+  exit 1
+}
+
+collect_configs() {
+  mapfile -t CONFIGS < <(compgen -G "$CONFIG_GLOB" | LC_ALL=C sort)
+}
+
 init_slots() {
   local idx
 
   SLOT_PIDS=()
   SLOT_CONFIGS=()
+  SLOT_STATUS_FILES=()
   RUN_STATUS=0
 
   for idx in "${!GPU_LIST[@]}"; do
     SLOT_PIDS[$idx]=""
     SLOT_CONFIGS[$idx]=""
+    SLOT_STATUS_FILES[$idx]=""
   done
+}
+
+finalize_slot() {
+  local idx="$1"
+  local status_code="$2"
+  local status_file="${SLOT_STATUS_FILES[$idx]:-}"
+
+  if [[ "$status_code" -ne 0 ]]; then
+    echo "[ff] ${SLOT_CONFIGS[$idx]:-unknown} exited with status $status_code" >&2
+    RUN_STATUS=1
+  fi
+
+  if [[ -n "$status_file" ]]; then
+    rm -f "$status_file"
+  fi
+
+  SLOT_PIDS[$idx]=""
+  SLOT_CONFIGS[$idx]=""
+  SLOT_STATUS_FILES[$idx]=""
 }
 
 handle_interrupt() {
@@ -104,52 +182,46 @@ handle_interrupt() {
       SLOT_PIDS[$idx]=""
       SLOT_CONFIGS[$idx]=""
     fi
+    if [[ -n "${SLOT_STATUS_FILES[$idx]:-}" ]]; then
+      rm -f "${SLOT_STATUS_FILES[$idx]}"
+      SLOT_STATUS_FILES[$idx]=""
+    fi
   done
 
   exit 130
 }
 
-wait_for_slot() {
-  while true; do
-    refresh_slots
-    if has_free_slot; then
-      return
-    fi
-    sleep 5
-  done
-}
-
 refresh_slots() {
   local idx
   local pid
-  local running_pid
-  local is_running
-  local -a running_pids=()
-
-  mapfile -t running_pids < <(jobs -pr)
+  local status_file
+  local status_code
 
   for idx in "${!GPU_LIST[@]}"; do
     pid="${SLOT_PIDS[$idx]:-}"
+    status_file="${SLOT_STATUS_FILES[$idx]:-}"
     if [[ -z "$pid" ]]; then
       continue
     fi
 
-    is_running=0
-    if [[ "${#running_pids[@]}" -gt 0 ]]; then
-      for running_pid in "${running_pids[@]}"; do
-        if [[ "$running_pid" == "$pid" ]]; then
-          is_running=1
-          break
-        fi
-      done
+    if [[ -n "$status_file" && -f "$status_file" ]]; then
+      status_code="$(<"$status_file")"
+      set +e
+      wait "$pid"
+      set -e
+      finalize_slot "$idx" "$status_code"
+      continue
     fi
 
-    if [[ "$is_running" -eq 0 ]]; then
-      if ! wait "$pid"; then
-        RUN_STATUS=1
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+      set +e
+      wait "$pid"
+      status_code=$?
+      set -e
+      if [[ -n "$status_file" && -f "$status_file" ]]; then
+        status_code="$(<"$status_file")"
       fi
-      SLOT_PIDS[$idx]=""
-      SLOT_CONFIGS[$idx]=""
+      finalize_slot "$idx" "$status_code"
     fi
   done
 }
@@ -167,13 +239,22 @@ has_free_slot() {
 find_free_gpu_slot() {
   local idx
   for idx in "${!GPU_LIST[@]}"; do
-    local pid="${SLOT_PIDS[$idx]:-}"
-    if [[ -z "$pid" ]]; then
-      echo "$idx"
+    if [[ -z "${SLOT_PIDS[$idx]:-}" ]]; then
+      printf '%s\n' "$idx"
       return
     fi
   done
-  echo "-1"
+  printf '%s\n' "-1"
+}
+
+wait_for_slot() {
+  while true; do
+    refresh_slots
+    if has_free_slot; then
+      return
+    fi
+    sleep 5
+  done
 }
 
 wait_all() {
@@ -194,42 +275,82 @@ wait_all() {
       return "$RUN_STATUS"
     fi
 
-    # echo "[ff] waiting for ${#GPU_LIST[@]} GPU slots to be free..." >&2
     sleep 5
   done
 }
 
-cd "$PROJECT_ROOT"
-mkdir -p "$LOG_ROOT"
+launch_job() {
+  local gpu_id="$1"
+  local config_path="$2"
+  local config_name="$3"
+  local log_path="$4"
+  local status_path="$5"
+  local extra_args_label=""
 
-RUNNER_CMD="$(resolve_runner)"
-split_csv "$GPU_IDS" GPU_LIST
-TRAIN_ARGS_SHELL=""
-if [[ "${#TRAIN_ARGS[@]}" -gt 0 ]]; then
-  TRAIN_ARGS_SHELL="$(shell_quote_args "${TRAIN_ARGS[@]}")"
-fi
+  rm -f "$status_path"
+  if [[ "${#TRAIN_ARGS[@]}" -gt 0 ]]; then
+    extra_args_label="$(join_shell_words "${TRAIN_ARGS[@]}")"
+  fi
+
+  (
+    local exit_code
+
+    if ! cd "$PROJECT_ROOT"; then
+      exit_code=$?
+      printf '%s\n' "$exit_code" >"$status_path"
+      exit "$exit_code"
+    fi
+
+    export CUDA_VISIBLE_DEVICES="$gpu_id"
+
+    echo "[ff] host: $(hostname)"
+    echo "[ff] start: $(date '+%Y-%m-%d %H:%M:%S %z')"
+    echo "[ff] config: $config_path"
+    echo "[ff] run: $config_name"
+    echo "[ff] gpu: $gpu_id"
+    echo "[ff] runner: $RUNNER_LABEL"
+    echo "[ff] train module: $TRAIN_MODULE"
+    if [[ -n "$extra_args_label" ]]; then
+      echo "[ff] extra args: $extra_args_label"
+    fi
+
+    set +e
+    "${RUNNER_CMD[@]}" -m "$TRAIN_MODULE" --config "$config_path" "${TRAIN_ARGS[@]}"
+    exit_code=$?
+    set -e
+
+    printf '%s\n' "$exit_code" >"$status_path"
+    exit "$exit_code"
+  ) >"$log_path" 2>&1 &
+
+  LAUNCH_PID=$!
+}
+
+cd "$PROJECT_ROOT"
+mkdir -p "$LOG_ROOT" "$STATE_ROOT"
+
+prepare_runner
+parse_gpu_ids
 
 if [[ "${#GPU_LIST[@]}" -eq 0 ]]; then
   echo "[ff] GPU_IDS must list at least one CUDA device." >&2
   exit 1
 fi
 
-mapfile -t CONFIGS < <(compgen -G "$CONFIG_GLOB" | sort)
+collect_configs
 if [[ "${#CONFIGS[@]}" -eq 0 ]]; then
   echo "[ff] no configs matched: $CONFIG_GLOB" >&2
   exit 1
 fi
 
 echo "[ff] project root: $PROJECT_ROOT"
-echo "[ff] runner: $RUNNER_CMD"
+echo "[ff] runner: $RUNNER_LABEL"
 echo "[ff] gpu ids: ${GPU_LIST[*]}"
 echo "[ff] configs: ${#CONFIGS[@]}"
 if [[ "${#TRAIN_ARGS[@]}" -gt 0 ]]; then
   echo "[ff] extra train args: ${TRAIN_ARGS[*]}"
 fi
 
-declare -a SLOT_PIDS=()
-declare -a SLOT_CONFIGS=()
 init_slots
 trap 'handle_interrupt INT' INT
 trap 'handle_interrupt TERM' TERM
@@ -245,13 +366,13 @@ for config_path in "${CONFIGS[@]}"; do
   gpu_id="${GPU_LIST[$slot_index]}"
   config_name="$(basename "$config_path" .yaml)"
   log_path="$LOG_ROOT/${config_name}.log"
+  status_path="$STATE_ROOT/${config_name}.status"
 
   echo "[ff] launching $config_name on cuda:$gpu_id"
-  CUDA_VISIBLE_DEVICES="$gpu_id" bash -lc \
-    "cd \"$PROJECT_ROOT\" && exec $RUNNER_CMD -m $TRAIN_MODULE --config \"$config_path\" $TRAIN_ARGS_SHELL" \
-    >"$log_path" 2>&1 &
-  SLOT_PIDS[$slot_index]=$!
+  launch_job "$gpu_id" "$config_path" "$config_name" "$log_path" "$status_path"
+  SLOT_PIDS[$slot_index]="$LAUNCH_PID"
   SLOT_CONFIGS[$slot_index]="$config_name"
+  SLOT_STATUS_FILES[$slot_index]="$status_path"
 done
 
 if wait_all; then
