@@ -186,7 +186,7 @@ wait_all() {
       return "$RUN_STATUS"
     fi
 
-    echo "[ff] waiting for ${#GPU_LIST[@]} GPU slots to be free..." >&2
+    # echo "[ff] waiting for ${#GPU_LIST[@]} GPU slots to be free..." >&2
     sleep 5
   done
 }
