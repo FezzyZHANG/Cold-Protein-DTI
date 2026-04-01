@@ -42,8 +42,15 @@ split_csv() {
   local input="$1"
   local output_var="$2"
   local -a parsed_values=()
-  IFS=',' read -r -a parsed_values <<< "$input"
-  eval "$output_var=(\"\${parsed_values[@]}\")"
+  if [[ -n "$input" ]]; then
+    IFS=',' read -r -a parsed_values <<< "$input"
+  fi
+
+  if [[ "${#parsed_values[@]}" -gt 0 ]]; then
+    eval "$output_var=(\"\${parsed_values[@]}\")"
+  else
+    eval "$output_var=()"
+  fi
 }
 
 shell_quote_args() {
@@ -128,12 +135,14 @@ refresh_slots() {
     fi
 
     is_running=0
-    for running_pid in "${running_pids[@]}"; do
-      if [[ "$running_pid" == "$pid" ]]; then
-        is_running=1
-        break
-      fi
-    done
+    if [[ "${#running_pids[@]}" -gt 0 ]]; then
+      for running_pid in "${running_pids[@]}"; do
+        if [[ "$running_pid" == "$pid" ]]; then
+          is_running=1
+          break
+        fi
+      done
+    fi
 
     if [[ "$is_running" -eq 0 ]]; then
       if ! wait "$pid"; then
@@ -195,7 +204,10 @@ mkdir -p "$LOG_ROOT"
 
 RUNNER_CMD="$(resolve_runner)"
 split_csv "$GPU_IDS" GPU_LIST
-TRAIN_ARGS_SHELL="$(shell_quote_args "${TRAIN_ARGS[@]}")"
+TRAIN_ARGS_SHELL=""
+if [[ "${#TRAIN_ARGS[@]}" -gt 0 ]]; then
+  TRAIN_ARGS_SHELL="$(shell_quote_args "${TRAIN_ARGS[@]}")"
+fi
 
 if [[ "${#GPU_LIST[@]}" -eq 0 ]]; then
   echo "[ff] GPU_IDS must list at least one CUDA device." >&2
