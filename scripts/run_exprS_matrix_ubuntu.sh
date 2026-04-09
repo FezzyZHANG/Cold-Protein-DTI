@@ -5,12 +5,14 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_GLOB="${CONFIG_GLOB:-$PROJECT_ROOT/config/experiments/exprS*.yaml}"
 LOG_ROOT="${LOG_ROOT:-$PROJECT_ROOT/logs/exprS}"
 STATE_ROOT="${STATE_ROOT:-$LOG_ROOT/.run_exprS_matrix_ubuntu}"
+RESULT_ROOT="${RESULT_ROOT:-/root/autodl-tmp/results}"
 GPU_IDS="${GPU_IDS:-0,1,2,3}"
 TRAIN_MODULE="${TRAIN_MODULE:-src.train}"
 UV_SYNC_EXTRAS="${UV_SYNC_EXTRAS:---extra train --extra esm}"
 RUNNER_SPEC="${RUNNER:-}"
 INTERRUPTED=0
 TRAIN_ARGS=()
+declare -a DEFAULT_TRAIN_ARGS=()
 
 declare -a GPU_LIST=()
 declare -a CONFIGS=()
@@ -37,6 +39,8 @@ Options:
                           default: logs/exprS
   --state-root <dir>      Directory for scheduler status files
                           default: <log-root>/.run_exprS_matrix_ubuntu
+  --result-root <dir>     Default output.root_dir for training runs
+                          default: /root/autodl-tmp/results
   --gpu-ids <csv>         Comma-separated GPU ids, e.g. 0,1,2,3
                           default: 0,1,2,3
   --runner <cmd>          Override Python runner command, e.g. ".venv/bin/python"
@@ -47,13 +51,14 @@ Options:
   -h, --help              Show this help message
 
 Environment overrides:
-  CONFIG_GLOB, LOG_ROOT, STATE_ROOT, GPU_IDS, RUNNER, TRAIN_MODULE,
+  CONFIG_GLOB, LOG_ROOT, STATE_ROOT, RESULT_ROOT, GPU_IDS, RUNNER, TRAIN_MODULE,
   UV_SYNC_EXTRAS
 
 Examples:
   bash scripts/run_exprS_matrix_ubuntu.sh
   bash scripts/run_exprS_matrix_ubuntu.sh --gpu-ids 0,1
   bash scripts/run_exprS_matrix_ubuntu.sh --config-glob 'config/experiments/exprS2_*.yaml'
+  bash scripts/run_exprS_matrix_ubuntu.sh --result-root /root/autodl-tmp/results
   bash scripts/run_exprS_matrix_ubuntu.sh -- --seed 42
 EOF
 }
@@ -90,6 +95,10 @@ parse_args() {
         ;;
       --state-root)
         STATE_ROOT="${2:?missing value for --state-root}"
+        shift 2
+        ;;
+      --result-root)
+        RESULT_ROOT="${2:?missing value for --result-root}"
         shift 2
         ;;
       --gpu-ids)
@@ -149,6 +158,10 @@ parse_uv_sync_extras() {
   if [[ -n "$UV_SYNC_EXTRAS" ]]; then
     read -r -a UV_SYNC_EXTRA_ARGS <<< "$UV_SYNC_EXTRAS"
   fi
+}
+
+prepare_default_train_args() {
+  DEFAULT_TRAIN_ARGS=(--set "output.root_dir=$RESULT_ROOT")
 }
 
 prepare_runner() {
@@ -372,8 +385,8 @@ launch_job() {
   local extra_args_label=""
 
   rm -f "$status_path"
-  if [[ "${#TRAIN_ARGS[@]}" -gt 0 ]]; then
-    extra_args_label="$(join_shell_words "${TRAIN_ARGS[@]}")"
+  if [[ "${#DEFAULT_TRAIN_ARGS[@]}" -gt 0 || "${#TRAIN_ARGS[@]}" -gt 0 ]]; then
+    extra_args_label="$(join_shell_words "${DEFAULT_TRAIN_ARGS[@]}" "${TRAIN_ARGS[@]}")"
   fi
 
   (
@@ -403,7 +416,7 @@ launch_job() {
     fi
 
     set +e
-    "${RUNNER_CMD[@]}" -m "$TRAIN_MODULE" --config "$config_path" "${TRAIN_ARGS[@]}"
+    "${RUNNER_CMD[@]}" -m "$TRAIN_MODULE" --config "$config_path" "${DEFAULT_TRAIN_ARGS[@]}" "${TRAIN_ARGS[@]}"
     exit_code=$?
     set -e
 
@@ -422,6 +435,7 @@ mkdir -p "$LOG_ROOT" "$STATE_ROOT"
 
 prepare_runner
 parse_gpu_ids
+prepare_default_train_args
 
 if [[ "${#GPU_LIST[@]}" -eq 0 ]]; then
   echo "[exprS] GPU_IDS must list at least one CUDA device." >&2
@@ -439,6 +453,8 @@ echo "[exprS] runner: $RUNNER_LABEL"
 echo "[exprS] gpu ids: ${GPU_LIST[*]}"
 echo "[exprS] configs: ${#CONFIGS[@]}"
 echo "[exprS] log root: $LOG_ROOT"
+echo "[exprS] result root: $RESULT_ROOT"
+echo "[exprS] default train args: ${DEFAULT_TRAIN_ARGS[*]}"
 if [[ "${#TRAIN_ARGS[@]}" -gt 0 ]]; then
   echo "[exprS] extra train args: ${TRAIN_ARGS[*]}"
 fi
