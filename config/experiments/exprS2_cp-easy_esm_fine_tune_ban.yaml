@@ -24,7 +24,7 @@ model:
     name: esm
     mode: finetuned
     hidden_dim: 256
-    dropout: 0.1
+    dropout: 0.01
     model_name: esm2_t33_650M_UR50D
     local_checkpoint_path: artifacts/pretrained/esm2_t33_650M_UR50D
     repr_layer: null
@@ -36,9 +36,9 @@ model:
     dropout: 0.1
 
 training:
-  epochs: 40
+  epochs: 60
   batch_size: 4
-  lr: 0.00005
+  lr: 0.0001
   weight_decay: 0.00001
   amp: true
   num_workers: 0
@@ -50,7 +50,7 @@ training:
 
 output:
   root_dir: results
-  save_checkpoints: false
+  save_checkpoints: true
   save_every_n_epochs: 1
   allow_rerun_suffix: true
 

@@ -1,12 +1,12 @@
-run_name: exprS1_cp-hard_esm_fine_tune_concat_s42
+run_name: exprS2_cp-easy_esm_part_frozen_ban
 seed: -1
 
 data:
   dataset_name: scope_dti
-  split_name: cp-hard
-  split_dir: data/splits/cp-hard_sub500000
+  split_name: cp-easy
+  split_dir: data/splits/cp-easy_sub500000
   raw_path: data/scope_dti_with_inchikey.parquet
-  graph_cache_path: data/splits/cp-hard_sub500000/graph_cache.pt
+  graph_cache_path: data/splits/cp-easy_sub500000/graph_cache.pt
   max_protein_length: 1022
 
 model:
@@ -28,17 +28,17 @@ model:
     model_name: esm2_t33_650M_UR50D
     local_checkpoint_path: artifacts/pretrained/esm2_t33_650M_UR50D
     repr_layer: null
-    freeze_n_layers: 0
+    freeze_n_layers: 30
     max_input_length: 1022
   fusion:
-    name: concat
+    name: ban
     hidden_dim: 256
     dropout: 0.1
 
 training:
   epochs: 60
   batch_size: 4
-  lr: 0.0001
+  lr: 0.0002
   weight_decay: 0.00001
   amp: true
   num_workers: 0
