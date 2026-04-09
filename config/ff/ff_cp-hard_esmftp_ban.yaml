@@ -11,7 +11,7 @@ data:
 
 model:
   hidden_dim: 256
-  dropout: 0.1
+  dropout: 0.01
   drug_encoder:
     name: gvp
     node_hidden_scalar: 256
@@ -19,12 +19,12 @@ model:
     edge_hidden_scalar: 64
     edge_hidden_vector: 4
     num_layers: 3
-    dropout: 0.1
+    dropout: 0.01
   protein_encoder:
     name: esm
     mode: finetuned
     hidden_dim: 256
-    dropout: 0.1
+    dropout: 0.01
     model_name: esm2_t33_650M_UR50D
     local_checkpoint_path: artifacts/pretrained/esm2_t33_650M_UR50D
     repr_layer: null
@@ -33,7 +33,7 @@ model:
   fusion:
     name: ban
     hidden_dim: 256
-    dropout: 0.1
+    dropout: 0.01
 
 training:
   epochs: 80
