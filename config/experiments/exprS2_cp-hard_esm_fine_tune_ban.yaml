@@ -32,8 +32,16 @@ model:
     max_input_length: 1022
   fusion:
     name: ban
-    hidden_dim: 256
+    hidden_dim: 512
+    classifier_hidden_dim: 512
+    joint_dim: 384
+    glimpses: 4
     dropout: 0.1
+    drug_feature_mode: token
+    protein_feature_mode: token
+    use_global_features: true
+    attention_softmax: true
+    norm: layernorm
 
 training:
   epochs: 60

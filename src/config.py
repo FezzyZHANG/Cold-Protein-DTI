@@ -341,10 +341,37 @@ def _normalize_model_config(model_cfg: dict[str, Any]) -> dict[str, Any]:
         fusion_cfg = {"name": fusion_cfg}
     fusion_cfg["name"] = str(fusion_cfg.get("name", "concat")).lower()
     fusion_cfg.setdefault("hidden_dim", normalized.get("hidden_dim", 256))
-    fusion_cfg.setdefault("glimpses", 2)
     fusion_cfg.setdefault("dropout", normalized.get("dropout", 0.1))
     if fusion_cfg["name"] not in {"concat", "ban"}:
         raise ConfigError("Fusion head must be one of: concat, ban.")
+    if fusion_cfg["name"] == "ban":
+        fusion_cfg.setdefault("joint_dim", normalized.get("hidden_dim", 256))
+        fusion_cfg.setdefault("classifier_hidden_dim", fusion_cfg["hidden_dim"])
+        fusion_cfg.setdefault("glimpses", 2)
+        fusion_cfg.setdefault("drug_feature_mode", "token")
+        fusion_cfg.setdefault("protein_feature_mode", "token")
+        fusion_cfg.setdefault("use_global_features", True)
+        fusion_cfg.setdefault("attention_softmax", True)
+        fusion_cfg.setdefault("norm", "layernorm")
+
+        for key in ("drug_feature_mode", "protein_feature_mode"):
+            fusion_cfg[key] = str(fusion_cfg[key]).lower()
+            if fusion_cfg[key] not in {"token", "pooled"}:
+                raise ConfigError(f"model.fusion.{key} must be `token` or `pooled`.")
+
+        fusion_cfg["norm"] = str(fusion_cfg["norm"]).lower().replace("_", "").replace("-", "")
+        if fusion_cfg["norm"] not in {"batchnorm", "bn", "layernorm", "ln", "none", "identity"}:
+            raise ConfigError("model.fusion.norm must be one of: batchnorm, layernorm, none.")
+
+        fusion_cfg["joint_dim"] = int(fusion_cfg["joint_dim"])
+        fusion_cfg["classifier_hidden_dim"] = int(fusion_cfg["classifier_hidden_dim"])
+        fusion_cfg["glimpses"] = int(fusion_cfg["glimpses"])
+        if fusion_cfg["joint_dim"] < 1:
+            raise ConfigError("model.fusion.joint_dim must be >= 1.")
+        if fusion_cfg["classifier_hidden_dim"] < 1:
+            raise ConfigError("model.fusion.classifier_hidden_dim must be >= 1.")
+        if fusion_cfg["glimpses"] < 1:
+            raise ConfigError("model.fusion.glimpses must be >= 1.")
 
     normalized["dropout"] = float(normalized.get("dropout", 0.1))
     normalized["drug_encoder"] = drug_cfg

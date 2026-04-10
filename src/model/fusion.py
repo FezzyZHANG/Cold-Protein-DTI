@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from torch.nn.utils.weight_norm import weight_norm
 
-from src.model.common import activation_gain, init_batch_norm, init_linear, masked_mean
+from src.model.common import activation_gain, init_batch_norm, init_layer_norm, init_linear, masked_mean
 
 
 def _require_rank(tensor: torch.Tensor, rank: int, name: str) -> torch.Tensor:
@@ -39,6 +39,41 @@ def _promote_pair_dtype(left: torch.Tensor, right: torch.Tensor) -> tuple[torch.
     if right.dtype != common_dtype:
         right = right.to(common_dtype)
     return left, right
+
+
+def _canonicalize_norm_kind(kind: str | None) -> str:
+    """Normalize user-facing normalization aliases to a compact internal form."""
+
+    if kind is None:
+        return "none"
+    normalized = str(kind).lower().replace("_", "").replace("-", "")
+    if normalized in {"batchnorm", "bn"}:
+        return "batchnorm"
+    if normalized in {"layernorm", "ln"}:
+        return "layernorm"
+    if normalized in {"none", "identity"}:
+        return "none"
+    raise ValueError(f"Unsupported normalization kind: {kind!r}")
+
+
+def _make_feature_norm(dim: int, kind: str) -> nn.Module:
+    """Create a conservative feature normalization layer for rank-2 activations."""
+
+    normalized_kind = _canonicalize_norm_kind(kind)
+    if normalized_kind == "batchnorm":
+        return nn.BatchNorm1d(int(dim))
+    if normalized_kind == "layernorm":
+        return nn.LayerNorm(int(dim))
+    return nn.Identity()
+
+
+def _reset_feature_norm(module: nn.Module) -> None:
+    """Initialize the requested normalization layer as a no-op."""
+
+    if isinstance(module, nn.BatchNorm1d):
+        init_batch_norm(module)
+    elif isinstance(module, nn.LayerNorm):
+        init_layer_norm(module)
 
 
 def _disabled_autocast_context(device_type: str) -> torch.amp.autocast_mode.autocast | nullcontext:
@@ -97,6 +132,7 @@ class BANLayer(nn.Module):
         act: str = "ReLU",
         dropout: float = 0.2,
         k: int = 3,
+        norm: str = "layernorm",
     ) -> None:
         super().__init__()
         self.c = 32
@@ -117,14 +153,14 @@ class BANLayer(nn.Module):
         else:
             self.h_net = _make_weight_norm_linear(self.h_dim * self.k, self.h_out)
 
-        self.bn = nn.BatchNorm1d(self.h_dim)
+        self.output_norm = _make_feature_norm(self.h_dim, norm)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         if hasattr(self, "h_mat"):
             nn.init.xavier_uniform_(self.h_mat)
             nn.init.zeros_(self.h_bias)
-        init_batch_norm(self.bn)
+        _reset_feature_norm(self.output_norm)
 
     def attention_pooling(self, v: torch.Tensor, q: torch.Tensor, att_map: torch.Tensor) -> torch.Tensor:
         fusion_logits = torch.einsum("bvk,bvq,bqk->bk", v, att_map, q)
@@ -133,7 +169,14 @@ class BANLayer(nn.Module):
             fusion_logits = self.p_net(fusion_logits).squeeze(1) * self.k
         return fusion_logits
 
-    def forward(self, v: torch.Tensor, q: torch.Tensor, softmax: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        v: torch.Tensor,
+        q: torch.Tensor,
+        v_mask: torch.Tensor | None = None,
+        q_mask: torch.Tensor | None = None,
+        softmax: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         v = _require_rank(v, 3, "drug BAN input")
         q = _require_rank(q, 3, "protein BAN input")
         if v.size(0) != q.size(0):
@@ -141,11 +184,29 @@ class BANLayer(nn.Module):
                 "Drug and protein BAN inputs must share the same batch size. "
                 f"Received {v.size(0)} and {q.size(0)}."
             )
+        if v_mask is not None:
+            v_mask = _require_rank(v_mask, 2, "drug BAN mask").to(dtype=torch.bool)
+            if v_mask.shape != v.shape[:2]:
+                raise ValueError(
+                    "Drug BAN mask must match the first two dimensions of the BAN input. "
+                    f"Received mask shape {tuple(v_mask.shape)} for features {tuple(v.shape)}."
+                )
+        if q_mask is not None:
+            q_mask = _require_rank(q_mask, 2, "protein BAN mask").to(dtype=torch.bool)
+            if q_mask.shape != q.shape[:2]:
+                raise ValueError(
+                    "Protein BAN mask must match the first two dimensions of the BAN input. "
+                    f"Received mask shape {tuple(q_mask.shape)} for features {tuple(q.shape)}."
+                )
 
         v_num = v.size(1)
         q_num = q.size(1)
         v_proj = self.v_net(v)
         q_proj = self.q_net(q)
+        if v_mask is not None:
+            v_proj = v_proj * v_mask.unsqueeze(-1).to(v_proj.dtype)
+        if q_mask is not None:
+            q_proj = q_proj * q_mask.unsqueeze(-1).to(q_proj.dtype)
 
         if self.h_out <= self.c:
             att_maps = torch.einsum("xhyk,bvk,bqk->bhvq", self.h_mat, v_proj, q_proj) + self.h_bias
@@ -154,45 +215,72 @@ class BANLayer(nn.Module):
             att_maps = self.h_net(bilinear.transpose(1, 2).transpose(2, 3))
             att_maps = att_maps.transpose(2, 3).transpose(1, 2)
 
+        valid_pairs: torch.Tensor | None = None
+        if v_mask is not None or q_mask is not None:
+            if v_mask is None:
+                v_mask = torch.ones(v.shape[:2], dtype=torch.bool, device=v.device)
+            if q_mask is None:
+                q_mask = torch.ones(q.shape[:2], dtype=torch.bool, device=q.device)
+            valid_pairs = v_mask.unsqueeze(1).unsqueeze(3) & q_mask.unsqueeze(1).unsqueeze(2)
+
         if softmax:
-            probs = nn.functional.softmax(att_maps.view(-1, self.h_out, v_num * q_num), dim=2)
+            flat_att_maps = att_maps.reshape(-1, self.h_out, v_num * q_num)
+            if valid_pairs is not None:
+                flat_valid_pairs = valid_pairs.reshape(-1, 1, v_num * q_num)
+                fill_value = torch.finfo(flat_att_maps.dtype).min
+                flat_att_maps = flat_att_maps.masked_fill(~flat_valid_pairs, fill_value)
+            probs = nn.functional.softmax(flat_att_maps, dim=2)
             att_maps = probs.view(-1, self.h_out, v_num, q_num)
+            if valid_pairs is not None:
+                att_maps = att_maps * valid_pairs.to(att_maps.dtype)
+                flat_probs = att_maps.reshape(-1, self.h_out, v_num * q_num)
+                flat_probs = flat_probs / flat_probs.sum(dim=2, keepdim=True).clamp_min(1.0e-8)
+                att_maps = flat_probs.view(-1, self.h_out, v_num, q_num)
+        elif valid_pairs is not None:
+            att_maps = att_maps * valid_pairs.to(att_maps.dtype)
 
         logits = self.attention_pooling(v_proj, q_proj, att_maps[:, 0, :, :])
         for index in range(1, self.h_out):
             logits = logits + self.attention_pooling(v_proj, q_proj, att_maps[:, index, :, :])
-        logits = self.bn(logits)
+        logits = self.output_norm(logits)
         return logits, att_maps
 
 
 class MLPDecoder(nn.Module):
     """Classifier head matching the stacked MLP used after BAN in SCOPE-DTI."""
 
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, binary: int = 1) -> None:
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        binary: int = 1,
+        norm: str = "layernorm",
+    ) -> None:
         super().__init__()
         self.fc1 = nn.Linear(in_dim, hidden_dim)
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.norm1 = _make_feature_norm(hidden_dim, norm)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        self.norm2 = _make_feature_norm(hidden_dim, norm)
         self.fc3 = nn.Linear(hidden_dim, out_dim)
-        self.bn3 = nn.BatchNorm1d(out_dim)
+        self.norm3 = _make_feature_norm(out_dim, norm)
         self.fc4 = nn.Linear(out_dim, binary)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         relu_gain = activation_gain("relu")
         init_linear(self.fc1, gain=relu_gain)
-        init_batch_norm(self.bn1)
+        _reset_feature_norm(self.norm1)
         init_linear(self.fc2, gain=relu_gain)
-        init_batch_norm(self.bn2)
+        _reset_feature_norm(self.norm2)
         init_linear(self.fc3, gain=relu_gain)
-        init_batch_norm(self.bn3)
+        _reset_feature_norm(self.norm3)
         init_linear(self.fc4)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        outputs = self.bn1(torch.relu(self.fc1(inputs)))
-        outputs = self.bn2(torch.relu(self.fc2(outputs)))
-        outputs = self.bn3(torch.relu(self.fc3(outputs)))
+        outputs = self.norm1(torch.relu(self.fc1(inputs)))
+        outputs = self.norm2(torch.relu(self.fc2(outputs)))
+        outputs = self.norm3(torch.relu(self.fc3(outputs)))
         return self.fc4(outputs)
 
 
@@ -229,7 +317,7 @@ class ConcatFusion(nn.Module):
 
 
 class BANFusion(nn.Module):
-    """SCOPE-style BAN over a pooled drug embedding and residue-level protein features."""
+    """Masked two-sided BAN over configurable drug/protein feature granularities."""
 
     def __init__(
         self,
@@ -239,53 +327,143 @@ class BANFusion(nn.Module):
         classifier_hidden_dim: int,
         glimpses: int,
         dropout: float,
+        drug_feature_mode: str = "token",
+        protein_feature_mode: str = "token",
+        use_global_features: bool = True,
+        attention_softmax: bool = True,
+        norm: str = "layernorm",
     ) -> None:
         super().__init__()
         self.drug_input_dim = int(drug_input_dim)
         self.protein_input_dim = int(protein_input_dim)
+        self.drug_feature_mode = str(drug_feature_mode).lower()
+        self.protein_feature_mode = str(protein_feature_mode).lower()
+        if self.drug_feature_mode not in {"token", "pooled"}:
+            raise ValueError(f"drug_feature_mode must be `token` or `pooled`. Received {drug_feature_mode!r}.")
+        if self.protein_feature_mode not in {"token", "pooled"}:
+            raise ValueError(f"protein_feature_mode must be `token` or `pooled`. Received {protein_feature_mode!r}.")
+        self.use_global_features = bool(use_global_features)
+        self.attention_softmax = bool(attention_softmax)
+        self.joint_dim = int(joint_dim)
         self.last_attention_maps: torch.Tensor | None = None
 
         ban = BANLayer(
             v_dim=self.drug_input_dim,
             q_dim=self.protein_input_dim,
-            h_dim=int(joint_dim),
+            h_dim=self.joint_dim,
             h_out=int(glimpses),
             dropout=dropout,
+            norm=norm,
         )
         self.ban = weight_norm(ban, name="h_mat", dim=None) if hasattr(ban, "h_mat") else ban
+        if self.use_global_features:
+            self.global_residual = nn.Sequential(
+                nn.Linear(self.drug_input_dim + self.protein_input_dim, self.joint_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            gelu_gain = activation_gain("gelu")
+            init_linear(self.global_residual[0], gain=gelu_gain)
+        else:
+            self.global_residual = None
         self.classifier = MLPDecoder(
-            in_dim=int(joint_dim),
+            in_dim=self.joint_dim,
             hidden_dim=int(classifier_hidden_dim),
-            out_dim=int(joint_dim),
+            out_dim=self.joint_dim,
             binary=1,
+            norm=norm,
         )
 
-    def forward(self, drug_output: dict[str, torch.Tensor], protein_output: dict[str, torch.Tensor]) -> torch.Tensor:
-        drug_pooled = _pooled_features(drug_output, "drug")
-        protein_tokens = _require_rank(protein_output["token_features"], 3, "protein token_features")
-        drug_pooled, protein_tokens = _promote_pair_dtype(drug_pooled, protein_tokens)
+    @staticmethod
+    def _select_sequence_features(
+        output: dict[str, torch.Tensor],
+        name: str,
+        mode: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if mode == "pooled":
+            pooled = _pooled_features(output, name)
+            pooled = _require_rank(pooled, 2, f"{name} pooled")
+            mask = torch.ones(pooled.size(0), 1, dtype=torch.bool, device=pooled.device)
+            return pooled.unsqueeze(1), mask
 
-        if drug_pooled.size(0) != protein_tokens.size(0):
+        token_features = _require_rank(output["token_features"], 3, f"{name} token_features")
+        mask = _require_rank(output["mask"], 2, f"{name} mask").to(dtype=torch.bool)
+        if token_features.shape[:2] != mask.shape:
+            raise ValueError(
+                f"{name} token features and mask must agree on batch/length. "
+                f"Received {tuple(token_features.shape)} and {tuple(mask.shape)}."
+            )
+        return token_features, mask
+
+    @staticmethod
+    def _ensure_nonempty_sequence(
+        features: torch.Tensor,
+        mask: torch.Tensor,
+        fallback: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        nonempty = mask.any(dim=1)
+        if bool(nonempty.all().item()):
+            return features, mask
+
+        repaired_features = features.clone()
+        repaired_mask = mask.clone()
+        empty_rows = ~nonempty
+        repaired_features[empty_rows] = 0
+        repaired_features[empty_rows, 0, :] = fallback[empty_rows]
+        repaired_mask[empty_rows] = False
+        repaired_mask[empty_rows, 0] = True
+        return repaired_features, repaired_mask
+
+    def forward(self, drug_output: dict[str, torch.Tensor], protein_output: dict[str, torch.Tensor]) -> torch.Tensor:
+        drug_global = _pooled_features(drug_output, "drug")
+        protein_global = _pooled_features(protein_output, "protein")
+        drug_features, drug_mask = self._select_sequence_features(
+            drug_output,
+            name="drug",
+            mode=self.drug_feature_mode,
+        )
+        protein_features, protein_mask = self._select_sequence_features(
+            protein_output,
+            name="protein",
+            mode=self.protein_feature_mode,
+        )
+
+        drug_features, protein_features = _promote_pair_dtype(drug_features, protein_features)
+        drug_global, protein_global = _promote_pair_dtype(drug_global, protein_global)
+
+        if drug_features.size(0) != protein_features.size(0):
             raise ValueError(
                 "Drug and protein features must share the same batch size. "
-                f"Received {drug_pooled.size(0)} and {protein_tokens.size(0)}."
+                f"Received {drug_features.size(0)} and {protein_features.size(0)}."
             )
-        if drug_pooled.size(1) != self.drug_input_dim:
+        if drug_features.size(2) != self.drug_input_dim:
             raise ValueError(
-                "Drug pooled feature width does not match the BAN input dimension. "
-                f"Expected {self.drug_input_dim}, received {drug_pooled.size(1)}."
+                "Drug feature width does not match the BAN input dimension. "
+                f"Expected {self.drug_input_dim}, received {drug_features.size(2)}."
             )
-        if protein_tokens.size(2) != self.protein_input_dim:
+        if protein_features.size(2) != self.protein_input_dim:
             raise ValueError(
-                "Protein token feature width does not match the BAN input dimension. "
-                f"Expected {self.protein_input_dim}, received {protein_tokens.size(2)}."
+                "Protein feature width does not match the BAN input dimension. "
+                f"Expected {self.protein_input_dim}, received {protein_features.size(2)}."
             )
 
-        device_type = drug_pooled.device.type
+        drug_features, drug_mask = self._ensure_nonempty_sequence(drug_features, drug_mask, drug_global)
+        protein_features, protein_mask = self._ensure_nonempty_sequence(protein_features, protein_mask, protein_global)
+
+        device_type = drug_features.device.type
         with _disabled_autocast_context(device_type):
             fused, attention_maps = self.ban(
-                drug_pooled.to(torch.float32).unsqueeze(1),
-                protein_tokens.to(torch.float32),
+                drug_features.to(torch.float32),
+                protein_features.to(torch.float32),
+                v_mask=drug_mask,
+                q_mask=protein_mask,
+                softmax=self.attention_softmax,
             )
+            if self.global_residual is not None:
+                global_features = torch.cat(
+                    [drug_global.to(torch.float32), protein_global.to(torch.float32)],
+                    dim=-1,
+                )
+                fused = fused + self.global_residual(global_features)
         self.last_attention_maps = attention_maps.detach()
         return self.classifier(fused).squeeze(-1)

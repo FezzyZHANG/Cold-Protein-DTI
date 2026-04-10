@@ -100,10 +100,15 @@ def build_model(config: dict[str, object]) -> DTIModel:
         fusion_head = BANFusion(
             drug_input_dim=int(drug_encoder.output_dim),
             protein_input_dim=int(protein_encoder.output_dim),
-            joint_dim=int(model_cfg["hidden_dim"]),
-            classifier_hidden_dim=int(fusion_cfg["hidden_dim"]),
+            joint_dim=int(fusion_cfg["joint_dim"]),
+            classifier_hidden_dim=int(fusion_cfg["classifier_hidden_dim"]),
             glimpses=int(fusion_cfg["glimpses"]),
             dropout=float(fusion_cfg["dropout"]),
+            drug_feature_mode=str(fusion_cfg["drug_feature_mode"]),
+            protein_feature_mode=str(fusion_cfg["protein_feature_mode"]),
+            use_global_features=bool(fusion_cfg["use_global_features"]),
+            attention_softmax=bool(fusion_cfg["attention_softmax"]),
+            norm=str(fusion_cfg["norm"]),
         )
 
     return DTIModel(drug_encoder=drug_encoder, protein_encoder=protein_encoder, fusion_head=fusion_head)
