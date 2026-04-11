@@ -353,6 +353,8 @@ def _normalize_model_config(model_cfg: dict[str, Any]) -> dict[str, Any]:
         fusion_cfg.setdefault("use_global_features", True)
         fusion_cfg.setdefault("attention_softmax", True)
         fusion_cfg.setdefault("norm", "layernorm")
+        fusion_cfg.setdefault("classifier_num_blocks", 2)
+        fusion_cfg.setdefault("classifier_expansion", 2.0)
 
         for key in ("drug_feature_mode", "protein_feature_mode"):
             fusion_cfg[key] = str(fusion_cfg[key]).lower()
@@ -366,12 +368,18 @@ def _normalize_model_config(model_cfg: dict[str, Any]) -> dict[str, Any]:
         fusion_cfg["joint_dim"] = int(fusion_cfg["joint_dim"])
         fusion_cfg["classifier_hidden_dim"] = int(fusion_cfg["classifier_hidden_dim"])
         fusion_cfg["glimpses"] = int(fusion_cfg["glimpses"])
+        fusion_cfg["classifier_num_blocks"] = int(fusion_cfg["classifier_num_blocks"])
+        fusion_cfg["classifier_expansion"] = float(fusion_cfg["classifier_expansion"])
         if fusion_cfg["joint_dim"] < 1:
             raise ConfigError("model.fusion.joint_dim must be >= 1.")
         if fusion_cfg["classifier_hidden_dim"] < 1:
             raise ConfigError("model.fusion.classifier_hidden_dim must be >= 1.")
         if fusion_cfg["glimpses"] < 1:
             raise ConfigError("model.fusion.glimpses must be >= 1.")
+        if fusion_cfg["classifier_num_blocks"] < 0:
+            raise ConfigError("model.fusion.classifier_num_blocks must be >= 0.")
+        if fusion_cfg["classifier_expansion"] < 1.0:
+            raise ConfigError("model.fusion.classifier_expansion must be >= 1.0.")
 
     normalized["dropout"] = float(normalized.get("dropout", 0.1))
     normalized["drug_encoder"] = drug_cfg

@@ -109,6 +109,8 @@ def build_model(config: dict[str, object]) -> DTIModel:
             use_global_features=bool(fusion_cfg["use_global_features"]),
             attention_softmax=bool(fusion_cfg["attention_softmax"]),
             norm=str(fusion_cfg["norm"]),
+            classifier_num_blocks=int(fusion_cfg["classifier_num_blocks"]),
+            classifier_expansion=float(fusion_cfg["classifier_expansion"]),
         )
 
     return DTIModel(drug_encoder=drug_encoder, protein_encoder=protein_encoder, fusion_head=fusion_head)

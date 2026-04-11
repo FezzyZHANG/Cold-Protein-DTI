@@ -246,6 +246,31 @@ class BANLayer(nn.Module):
         return logits, att_maps
 
 
+class ResidualMLPBlock(nn.Module):
+    """Pre-norm residual MLP block for classifier refinement."""
+
+    def __init__(self, dim: int, hidden_dim: int, dropout: float, norm: str) -> None:
+        super().__init__()
+        self.norm = _make_feature_norm(dim, norm)
+        self.fc1 = nn.Linear(dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def reset_parameters(self) -> None:
+        gelu_gain = activation_gain("gelu")
+        _reset_feature_norm(self.norm)
+        init_linear(self.fc1, gain=gelu_gain)
+        init_linear(self.fc2, gain=gelu_gain)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        outputs = self.fc1(self.norm(inputs))
+        outputs = torch.nn.functional.gelu(outputs)
+        outputs = self.dropout(outputs)
+        outputs = self.fc2(outputs)
+        outputs = self.dropout(outputs)
+        return inputs + outputs
+
+
 class MLPDecoder(nn.Module):
     """Classifier head matching the stacked MLP used after BAN in SCOPE-DTI."""
 
@@ -255,33 +280,52 @@ class MLPDecoder(nn.Module):
         hidden_dim: int,
         out_dim: int,
         binary: int = 1,
+        dropout: float = 0.0,
         norm: str = "layernorm",
+        num_blocks: int = 2,
+        expansion: float = 2.0,
     ) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(in_dim, hidden_dim)
-        self.norm1 = _make_feature_norm(hidden_dim, norm)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.norm2 = _make_feature_norm(hidden_dim, norm)
-        self.fc3 = nn.Linear(hidden_dim, out_dim)
-        self.norm3 = _make_feature_norm(out_dim, norm)
-        self.fc4 = nn.Linear(out_dim, binary)
+        self.input_norm = _make_feature_norm(in_dim, norm)
+        self.input_proj = nn.Linear(in_dim, hidden_dim)
+        self.input_dropout = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList(
+            [
+                ResidualMLPBlock(
+                    dim=hidden_dim,
+                    hidden_dim=max(hidden_dim, int(round(hidden_dim * expansion))),
+                    dropout=dropout,
+                    norm=norm,
+                )
+                for _ in range(int(num_blocks))
+            ]
+        )
+        self.head_norm = _make_feature_norm(hidden_dim, norm)
+        self.head_proj = nn.Linear(hidden_dim, out_dim)
+        self.head_dropout = nn.Dropout(dropout)
+        self.output = nn.Linear(out_dim, binary)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        relu_gain = activation_gain("relu")
-        init_linear(self.fc1, gain=relu_gain)
-        _reset_feature_norm(self.norm1)
-        init_linear(self.fc2, gain=relu_gain)
-        _reset_feature_norm(self.norm2)
-        init_linear(self.fc3, gain=relu_gain)
-        _reset_feature_norm(self.norm3)
-        init_linear(self.fc4)
+        gelu_gain = activation_gain("gelu")
+        _reset_feature_norm(self.input_norm)
+        init_linear(self.input_proj, gain=gelu_gain)
+        for block in self.blocks:
+            block.reset_parameters()
+        _reset_feature_norm(self.head_norm)
+        init_linear(self.head_proj, gain=gelu_gain)
+        init_linear(self.output)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        outputs = self.norm1(torch.relu(self.fc1(inputs)))
-        outputs = self.norm2(torch.relu(self.fc2(outputs)))
-        outputs = self.norm3(torch.relu(self.fc3(outputs)))
-        return self.fc4(outputs)
+        outputs = self.input_proj(self.input_norm(inputs))
+        outputs = torch.nn.functional.gelu(outputs)
+        outputs = self.input_dropout(outputs)
+        for block in self.blocks:
+            outputs = block(outputs)
+        outputs = self.head_proj(self.head_norm(outputs))
+        outputs = torch.nn.functional.gelu(outputs)
+        outputs = self.head_dropout(outputs)
+        return self.output(outputs)
 
 
 class ConcatFusion(nn.Module):
@@ -332,6 +376,8 @@ class BANFusion(nn.Module):
         use_global_features: bool = True,
         attention_softmax: bool = True,
         norm: str = "layernorm",
+        classifier_num_blocks: int = 2,
+        classifier_expansion: float = 2.0,
     ) -> None:
         super().__init__()
         self.drug_input_dim = int(drug_input_dim)
@@ -371,7 +417,10 @@ class BANFusion(nn.Module):
             hidden_dim=int(classifier_hidden_dim),
             out_dim=self.joint_dim,
             binary=1,
+            dropout=dropout,
             norm=norm,
+            num_blocks=int(classifier_num_blocks),
+            expansion=float(classifier_expansion),
         )
 
     @staticmethod

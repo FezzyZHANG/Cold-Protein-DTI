@@ -42,6 +42,8 @@ model:
     use_global_features: true
     attention_softmax: true
     norm: layernorm
+    classifier_num_blocks: 2
+    classifier_expansion: 2.0
 
 training:
   epochs: 80
