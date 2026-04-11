@@ -262,8 +262,8 @@ class MLPDecoder(nn.Module):
         self.norm1 = _make_feature_norm(hidden_dim, norm)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.norm2 = _make_feature_norm(hidden_dim, norm)
-        self.fc3 = nn.Linear(hidden_dim, out_dim)
-        self.norm3 = _make_feature_norm(out_dim, norm)
+        # self.fc3 = nn.Linear(hidden_dim, out_dim)
+        # self.norm3 = _make_feature_norm(out_dim, norm)
         self.fc4 = nn.Linear(out_dim, binary)
         self.reset_parameters()
 
@@ -273,14 +273,14 @@ class MLPDecoder(nn.Module):
         _reset_feature_norm(self.norm1)
         init_linear(self.fc2, gain=relu_gain)
         _reset_feature_norm(self.norm2)
-        init_linear(self.fc3, gain=relu_gain)
-        _reset_feature_norm(self.norm3)
+        # init_linear(self.fc3, gain=relu_gain)
+        # _reset_feature_norm(self.norm3)
         init_linear(self.fc4)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         outputs = self.norm1(torch.relu(self.fc1(inputs)))
         outputs = self.norm2(torch.relu(self.fc2(outputs)))
-        outputs = self.norm3(torch.relu(self.fc3(outputs)))
+        # outputs = self.norm3(torch.relu(self.fc3(outputs)))
         return self.fc4(outputs)
 
 
