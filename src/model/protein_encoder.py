@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from typing import Any
 
 import torch
 from torch import nn
@@ -93,10 +94,21 @@ class ESMProteinEncoder(nn.Module):
         repr_layer: int | None = None,
         local_checkpoint_path: str | None = None,
         freeze_n_layers: int = 0,
+        prefer_staged_artifacts: bool = True,
+        backend: str | None = None,
+        base_model_name: str | None = None,
+        base_checkpoint_path: str | None = None,
     ) -> None:
         super().__init__()
 
-        loaded_backbone = load_esm_backbone(model_name=model_name, local_checkpoint_path=local_checkpoint_path)
+        loaded_backbone = load_esm_backbone(
+            model_name=model_name,
+            local_checkpoint_path=local_checkpoint_path,
+            prefer_staged_artifacts=prefer_staged_artifacts,
+            backend=backend,
+            base_model_name=base_model_name,
+            base_checkpoint_path=base_checkpoint_path,
+        )
         self.backbone = loaded_backbone.backbone
         self.tokenizer = loaded_backbone.tokenizer
         self.backend = loaded_backbone.backend
@@ -147,10 +159,14 @@ class ESMProteinEncoder(nn.Module):
         module.eval()
 
     def _get_encoder_layers(self) -> list[nn.Module]:
-        encoder = getattr(self.backbone, "encoder", None)
-        layers = getattr(encoder, "layer", None)
+        if self.backend == "esmc":
+            transformer = getattr(self.backbone, "transformer", None)
+            layers = getattr(transformer, "blocks", None)
+        else:
+            encoder = getattr(self.backbone, "encoder", None)
+            layers = getattr(encoder, "layer", None)
         if layers is None:
-            raise RuntimeError("Unable to locate ESM encoder layers for partial freezing.")
+            raise RuntimeError(f"Unable to locate {self.backend} encoder layers for partial freezing.")
         return list(layers)
 
     def train(self, mode: bool = True) -> "ESMProteinEncoder":
@@ -163,7 +179,7 @@ class ESMProteinEncoder(nn.Module):
         self,
         sequences: list[str],
         device: torch.device,
-        context: nullcontext | torch.no_grad,
+        context: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         encoded = self.tokenizer(
             sequences,
@@ -195,12 +211,33 @@ class ESMProteinEncoder(nn.Module):
             mask &= input_ids.ne(token_id)
         return token_features, mask
 
+    def _forward_esmc(
+        self,
+        sequences: list[str],
+        context: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with context:
+            sequence_tokens = self.backbone._tokenize(sequences)
+            outputs = self.backbone(sequence_tokens=sequence_tokens)
+            if self.repr_layer == self.num_layers:
+                token_features = outputs.embeddings
+            else:
+                token_features = outputs.hidden_states[self.repr_layer]
+
+        mask = sequence_tokens.ne(int(self.tokenizer.pad_token_id))
+        for token_id in self.special_token_ids:
+            mask &= sequence_tokens.ne(token_id)
+        return token_features, mask
+
     def forward(self, batch: dict[str, torch.Tensor | list[str]]) -> dict[str, torch.Tensor]:
         sequences = [sequence[: self.max_input_length] for sequence in batch["protein_sequences"]]
         device = next(self.parameters()).device
 
         context = torch.no_grad() if self.mode == "frozen" else nullcontext()
-        token_features, mask = self._forward_huggingface(sequences, device, context)
+        if self.backend == "esmc":
+            token_features, mask = self._forward_esmc(sequences, context)
+        else:
+            token_features, mask = self._forward_huggingface(sequences, device, context)
 
         token_features = self.dropout(self.output_proj(token_features))
         token_features = token_features * mask.unsqueeze(-1)

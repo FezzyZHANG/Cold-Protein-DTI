@@ -7,6 +7,7 @@ import argparse
 from datetime import datetime
 import json
 from pathlib import Path
+from typing import Any
 import urllib.request
 
 
@@ -32,6 +33,43 @@ MODEL_MANIFEST = {
             "model.safetensors",
         ],
         "description": "Recommended ESM2 checkpoint for the cold-protein experiment scaffold.",
+    },
+    "esmc_600m": {
+        "files": [
+            {
+                "path": "README.md",
+                "url": "https://huggingface.co/EvolutionaryScale/esmc-600m-2024-12/resolve/main/README.md",
+            },
+            {
+                "path": "config.json",
+                "url": "https://huggingface.co/EvolutionaryScale/esmc-600m-2024-12/resolve/main/config.json",
+            },
+            {
+                "path": "data/weights/esmc_600m_2024_12_v0.pth",
+                "url": (
+                    "https://huggingface.co/EvolutionaryScale/esmc-600m-2024-12/resolve/main/"
+                    "data/weights/esmc_600m_2024_12_v0.pth"
+                ),
+            },
+        ],
+        "description": "ESM C 600M checkpoint for the optional `esmc` backend.",
+    },
+    "VESM_650M": {
+        "files": [
+            {
+                "path": "README.md",
+                "url": "https://huggingface.co/ntranoslab/vesm/resolve/main/README.md",
+            },
+            {
+                "path": "VESM_650M.pth",
+                "url": "https://huggingface.co/ntranoslab/vesm/resolve/main/VESM_650M.pth",
+            },
+        ],
+        "description": (
+            "VESM 650M overlay checkpoint. Runtime also needs the staged "
+            "`esm2_t33_650M_UR50D` base model."
+        ),
+        "requires": ["esm2_t33_650M_UR50D"],
     },
 }
 
@@ -73,6 +111,12 @@ def download_file(url: str, destination: Path, proxy: str | None, force: bool) -
     print()
 
 
+def iter_manifest_files(info: dict[str, Any]) -> list[tuple[str, str]]:
+    if "base_url" in info:
+        return [(filename, f"{info['base_url']}/{filename}") for filename in info["files"]]
+    return [(item["path"], item["url"]) for item in info["files"]]
+
+
 def write_metadata(output_dir: Path, model_name: str, source_urls: list[str]) -> None:
     metadata = {
         "model_name": model_name,
@@ -100,7 +144,10 @@ def main() -> None:
     if args.show_models:
         for name, info in MODEL_MANIFEST.items():
             print(f"{name}: {info['description']}")
-            print(f"  {info['base_url']}")
+            if "base_url" in info:
+                print(f"  {info['base_url']}")
+            for requirement in info.get("requires", []):
+                print(f"  requires: {requirement}")
         return
 
     models = args.model or ["esm2_t33_650M_UR50D"]
@@ -113,11 +160,20 @@ def main() -> None:
 
         info = MODEL_MANIFEST[model_name]
         model_output_dir = output_dir / model_name
-        source_urls = [f"{info['base_url']}/{filename}" for filename in info["files"]]
+        manifest_files = iter_manifest_files(info)
+        source_urls = [source_url for _, source_url in manifest_files]
         print(f"[download] model={model_name}")
         print(f"[download] target={model_output_dir}")
-        for filename, source_url in zip(info["files"], source_urls):
-            output_path = model_output_dir / filename
+        for requirement in info.get("requires", []):
+            required_path = output_dir / requirement
+            if not required_path.exists():
+                print(
+                    "[download] note: "
+                    f"{model_name} expects staged dependency {required_path}. "
+                    f"Download it with `--model {requirement}` if it is not already present."
+                )
+        for relative_path, source_url in manifest_files:
+            output_path = model_output_dir / relative_path
             print(f"[download] source={source_url}")
             print(f"[download] file={output_path}")
             download_file(source_url, output_path, proxy=args.proxy, force=bool(args.force))

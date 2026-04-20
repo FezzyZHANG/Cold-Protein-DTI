@@ -1,0 +1,75 @@
+run_name: exprS3_cp-hard_vesm_frozen_concat
+seed: -1
+
+data:
+  dataset_name: scope_dti
+  split_name: cp-hard
+  split_dir: data/splits/cp-hard_sub500000
+  raw_path: data/scope_dti_with_inchikey.parquet
+  graph_cache_path: data/splits/cp-hard_sub500000/graph_cache.pt
+  max_protein_length: 1022
+
+model:
+  hidden_dim: 256
+  dropout: 0.1
+  drug_encoder:
+    name: gvp
+    node_hidden_scalar: 256
+    node_hidden_vector: 16
+    edge_hidden_scalar: 64
+    edge_hidden_vector: 4
+    num_layers: 3
+    dropout: 0.1
+  protein_encoder:
+    name: vesm
+    mode: frozen
+    hidden_dim: 256
+    dropout: 0.01
+    model_name: VESM_650M
+    local_checkpoint_path: artifacts/pretrained/VESM_650M
+    base_model_name: esm2_t33_650M_UR50D
+    base_checkpoint_path: artifacts/pretrained/esm2_t33_650M_UR50D
+    repr_layer: null
+    freeze_n_layers: 0
+    max_input_length: 1022
+  fusion:
+    name: concat
+    hidden_dim: 256
+    dropout: 0.1
+
+training:
+  epochs: 80
+  batch_size: 8
+  lr: 0.0005
+  weight_decay: 0.00001
+  amp: true
+  num_workers: 0
+  device: cuda
+  early_stopping_patience: 8
+  resume: false
+  max_train_batches: null
+  max_eval_batches: null
+
+output:
+  root_dir: results
+  save_checkpoints: true
+  save_every_n_epochs: 1
+  allow_rerun_suffix: true
+
+metrics:
+  primary: auprc
+  threshold: 0.5
+  ks:
+    - 10
+    - 50
+    - 100
+  ef_fractions:
+    - 0.01
+    - 0.05
+  extra:
+    - precision
+    - recall
+    - auroc
+    - auprc
+    - f1
+    - mcc

@@ -87,6 +87,10 @@ def build_model(config: dict[str, object]) -> DTIModel:
             local_checkpoint_path=protein_cfg["local_checkpoint_path"],
             max_input_length=int(protein_cfg["max_input_length"]),
             freeze_n_layers=int(protein_cfg["freeze_n_layers"]),
+            prefer_staged_artifacts=bool(protein_cfg["prefer_staged_artifacts"]),
+            backend=protein_cfg["backend"],
+            base_model_name=protein_cfg["base_model_name"],
+            base_checkpoint_path=protein_cfg["base_checkpoint_path"],
         )
 
     if fusion_cfg["name"] == "concat":

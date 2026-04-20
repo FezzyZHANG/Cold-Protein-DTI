@@ -303,6 +303,8 @@ def _normalize_model_config(model_cfg: dict[str, Any]) -> dict[str, Any]:
     protein_cfg["name"] = str(protein_cfg.get("name", "cnn")).lower()
     if protein_cfg["name"] == "plm":
         protein_cfg["name"] = "esm"
+    if protein_cfg["name"] in {"esm-c", "esm_c"}:
+        protein_cfg["name"] = "esmc"
 
     protein_mode = protein_cfg.get("mode") or normalized.get("protein_encoder_mode")
     if protein_mode is None:
@@ -312,20 +314,30 @@ def _normalize_model_config(model_cfg: dict[str, Any]) -> dict[str, Any]:
     protein_cfg.setdefault("hidden_dim", 256)
     protein_cfg.setdefault("kernel_sizes", [5, 9, 15])
     protein_cfg.setdefault("dropout", normalized.get("dropout", 0.1))
-    protein_cfg.setdefault("model_name", "esm2_t33_650M_UR50D")
+    if "model_name" not in protein_cfg:
+        if protein_cfg["name"] == "esmc":
+            protein_cfg["model_name"] = "esmc_600m"
+        elif protein_cfg["name"] == "vesm":
+            protein_cfg["model_name"] = "VESM_650M"
+        else:
+            protein_cfg["model_name"] = "esm2_t33_650M_UR50D"
     protein_cfg.setdefault("local_checkpoint_path", None)
+    protein_cfg.setdefault("prefer_staged_artifacts", True)
+    protein_cfg.setdefault("backend", protein_cfg["name"] if protein_cfg["name"] in {"esmc", "vesm"} else None)
+    protein_cfg.setdefault("base_model_name", "esm2_t33_650M_UR50D" if protein_cfg["name"] == "vesm" else None)
+    protein_cfg.setdefault("base_checkpoint_path", None)
     protein_cfg.setdefault("repr_layer", None)
     protein_cfg.setdefault("max_input_length", 1024)
     protein_cfg.setdefault("freeze_n_layers", 0)
 
-    if protein_cfg["name"] not in {"cnn", "esm"}:
-        raise ConfigError("Protein encoder must be one of: cnn, esm.")
+    if protein_cfg["name"] not in {"cnn", "esm", "esmc", "vesm"}:
+        raise ConfigError("Protein encoder must be one of: cnn, esm, esmc, vesm.")
 
     if protein_cfg["name"] == "cnn" and protein_cfg["mode"] != "scratch":
         raise ConfigError("The CNN protein encoder only supports `mode: scratch`.")
 
-    if protein_cfg["name"] == "esm" and protein_cfg["mode"] not in {"frozen", "finetuned"}:
-        raise ConfigError("The ESM protein encoder supports `mode: frozen` or `mode: finetuned`.")
+    if protein_cfg["name"] in {"esm", "esmc", "vesm"} and protein_cfg["mode"] not in {"frozen", "finetuned"}:
+        raise ConfigError("Pretrained protein encoders support `mode: frozen` or `mode: finetuned`.")
 
     if protein_cfg["repr_layer"] is not None:
         protein_cfg["repr_layer"] = int(protein_cfg["repr_layer"])
@@ -335,6 +347,7 @@ def _normalize_model_config(model_cfg: dict[str, Any]) -> dict[str, Any]:
     protein_cfg["freeze_n_layers"] = int(protein_cfg["freeze_n_layers"])
     if protein_cfg["freeze_n_layers"] < 0:
         raise ConfigError("model.protein_encoder.freeze_n_layers must be >= 0.")
+    protein_cfg["prefer_staged_artifacts"] = bool(protein_cfg["prefer_staged_artifacts"])
 
     fusion_cfg = normalized.get("fusion", "concat")
     if isinstance(fusion_cfg, str):

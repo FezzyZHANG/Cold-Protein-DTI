@@ -8,7 +8,7 @@ STATE_ROOT="${STATE_ROOT:-$LOG_ROOT/.run_exprS_matrix_ubuntu}"
 RESULT_ROOT="${RESULT_ROOT:-/root/autodl-tmp/results}"
 GPU_IDS="${GPU_IDS:-0,1,2,3}"
 TRAIN_MODULE="${TRAIN_MODULE:-src.train}"
-UV_SYNC_EXTRAS="${UV_SYNC_EXTRAS:---extra train --extra esm}"
+UV_SYNC_EXTRAS="${UV_SYNC_EXTRAS:---extra train --extra esm --extra esmc}"
 RUNNER_SPEC="${RUNNER:-}"
 INTERRUPTED=0
 TRAIN_ARGS=()
@@ -47,7 +47,7 @@ Options:
   --train-module <name>   Python module to execute
                           default: src.train
   --uv-sync-extras <arg>  Args passed to uv sync/uv run when uv is used
-                          default: --extra train --extra esm
+                          default: --extra train --extra esm --extra esmc
   -h, --help              Show this help message
 
 Environment overrides:
@@ -210,7 +210,7 @@ prepare_runner() {
   done
 
   echo "[exprS] could not find a usable Python runner." >&2
-  echo "[exprS] create the environment with: uv sync --extra train --extra esm" >&2
+  echo "[exprS] create the environment with: uv sync --extra train --extra esm --extra esmc" >&2
   exit 1
 }
 
