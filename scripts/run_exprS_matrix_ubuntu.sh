@@ -12,7 +12,9 @@ UV_SYNC_EXTRAS="${UV_SYNC_EXTRAS:---extra train --extra esm --extra esmc}"
 RUNNER_SPEC="${RUNNER:-}"
 INTERRUPTED=0
 TRAIN_ARGS=()
+TRAIN_ARGS_COUNT=0
 declare -a DEFAULT_TRAIN_ARGS=()
+DEFAULT_TRAIN_ARGS_COUNT=0
 
 declare -a GPU_LIST=()
 declare -a CONFIGS=()
@@ -120,6 +122,7 @@ parse_args() {
       --)
         shift
         TRAIN_ARGS=("$@")
+        TRAIN_ARGS_COUNT="$#"
         return
         ;;
       -h|--help)
@@ -128,6 +131,7 @@ parse_args() {
         ;;
       *)
         TRAIN_ARGS=("$@")
+        TRAIN_ARGS_COUNT="$#"
         return
         ;;
     esac
@@ -162,6 +166,7 @@ parse_uv_sync_extras() {
 
 prepare_default_train_args() {
   DEFAULT_TRAIN_ARGS=(--set "output.root_dir=$RESULT_ROOT")
+  DEFAULT_TRAIN_ARGS_COUNT="${#DEFAULT_TRAIN_ARGS[@]}"
 }
 
 prepare_runner() {
@@ -383,10 +388,23 @@ launch_job() {
   local log_path="$4"
   local status_path="$5"
   local extra_args_label=""
+  local -a train_command=()
 
   rm -f "$status_path"
-  if [[ "${#DEFAULT_TRAIN_ARGS[@]}" -gt 0 || "${#TRAIN_ARGS[@]}" -gt 0 ]]; then
+  if [[ "$DEFAULT_TRAIN_ARGS_COUNT" -gt 0 && "$TRAIN_ARGS_COUNT" -gt 0 ]]; then
     extra_args_label="$(join_shell_words "${DEFAULT_TRAIN_ARGS[@]}" "${TRAIN_ARGS[@]}")"
+  elif [[ "$DEFAULT_TRAIN_ARGS_COUNT" -gt 0 ]]; then
+    extra_args_label="$(join_shell_words "${DEFAULT_TRAIN_ARGS[@]}")"
+  elif [[ "$TRAIN_ARGS_COUNT" -gt 0 ]]; then
+    extra_args_label="$(join_shell_words "${TRAIN_ARGS[@]}")"
+  fi
+
+  train_command=("${RUNNER_CMD[@]}" -m "$TRAIN_MODULE" --config "$config_path")
+  if [[ "$DEFAULT_TRAIN_ARGS_COUNT" -gt 0 ]]; then
+    train_command+=("${DEFAULT_TRAIN_ARGS[@]}")
+  fi
+  if [[ "$TRAIN_ARGS_COUNT" -gt 0 ]]; then
+    train_command+=("${TRAIN_ARGS[@]}")
   fi
 
   (
@@ -416,7 +434,7 @@ launch_job() {
     fi
 
     set +e
-    "${RUNNER_CMD[@]}" -m "$TRAIN_MODULE" --config "$config_path" "${DEFAULT_TRAIN_ARGS[@]}" "${TRAIN_ARGS[@]}"
+    "${train_command[@]}"
     exit_code=$?
     set -e
 
@@ -455,7 +473,7 @@ echo "[exprS] configs: ${#CONFIGS[@]}"
 echo "[exprS] log root: $LOG_ROOT"
 echo "[exprS] result root: $RESULT_ROOT"
 echo "[exprS] default train args: ${DEFAULT_TRAIN_ARGS[*]}"
-if [[ "${#TRAIN_ARGS[@]}" -gt 0 ]]; then
+if [[ "$TRAIN_ARGS_COUNT" -gt 0 ]]; then
   echo "[exprS] extra train args: ${TRAIN_ARGS[*]}"
 fi
 
