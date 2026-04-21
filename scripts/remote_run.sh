@@ -7,7 +7,7 @@ shift $(( $# >= 2 ? 2 : $# ))
 EXTRA_ARGS=("$@")
 
 if [[ -z "$MODE" || -z "$EXP_PATH" ]]; then
-  echo "Usage: bash scripts/remote_run.sh <train|eval> <config.yaml>"
+  echo "Usage: bash scripts/remote_run.sh <train|eval|kdbnet|scopedti> <config.yaml>"
   exit 1
 fi
 
@@ -47,6 +47,12 @@ case "$MODE" in
     ;;
   eval)
     exec python -m src.eval --config "$EXP_PATH" "${EXTRA_ARGS[@]}"
+    ;;
+  kdbnet)
+    exec python scripts/run_kdbnet_benchmark.py --config "$EXP_PATH" "${EXTRA_ARGS[@]}"
+    ;;
+  scopedti)
+    exec python scripts/run_scopedti_benchmark.py --config "$EXP_PATH" "${EXTRA_ARGS[@]}"
     ;;
   *)
     echo "Unknown mode: $MODE"

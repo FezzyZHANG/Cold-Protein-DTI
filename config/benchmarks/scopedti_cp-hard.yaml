@@ -1,0 +1,56 @@
+run_name: scopedti_cp-hard_graph_s42
+seed: 42
+
+data:
+  dataset_name: scope_dti
+  split_name: cp-hard
+  split_dir: data/splits/cp-hard_sub500000
+  drug_id_column: inchi_key
+  protein_id_column: target_uniprot_id
+  smiles_column: smiles
+  sequence_column: sequence
+  label_column: label
+
+export:
+  force_sdf: false
+
+scopedti:
+  home: artifacts/ScopeDTI/source
+  artifact_dir: artifacts/ScopeDTI/benchmarks/cp-hard
+  sdf_cache_path: artifacts/ScopeDTI/benchmarks/cp-hard/drug_sdf_cache.parquet
+  protein_mode: graph
+  coord_path: artifacts/ScopeDTI/source/data/unip_cords.pkl
+  graph_path: artifacts/ScopeDTI/benchmarks/cp-hard/protein_graph.pkl
+  preprocess_graphs: false
+  allow_missing_coords: false
+
+  # Keep Scope-DTI graph mode close to upstream while staying within this
+  # project's conservative remote-runtime assumptions.
+  max_protein_length: 1024
+  max_drug_nodes: 300
+  drug_edge_cutoff: 4.5
+  drug_num_rdf: 16
+  protein_edge_cutoff: 10.0
+  protein_num_knn: 5
+  protein_num_layers: 4
+  protein_embedding_dim: 320
+  drug_atom_hidden_dim:
+    - 320
+    - 64
+  decoder_in_dim: 256
+  decoder_hidden_dim: 128
+  decoder_out_dim: 64
+  ban_heads: 2
+  dropout: 0.1
+
+training:
+  epochs: 70
+  batch_size: 16
+  lr: 0.00005
+  num_workers: 0
+  save_model: true
+  resume: false
+
+output:
+  root_dir: runs/scopedti
+  allow_rerun_suffix: true

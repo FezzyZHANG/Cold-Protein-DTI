@@ -1,0 +1,84 @@
+run_name: kdbnet_cp-easy_s42
+seed: 42
+
+data:
+  dataset_name: scope_dti
+  split_name: cp-easy
+  split_dir: data/splits/cp-easy_sub500000
+
+export:
+  write_sdf: false
+
+kdbnet:
+  home: artifacts/kdbnet/source
+  artifact_dir: artifacts/kdbnet/benchmarks/cp-easy
+  drug_sdf_dir: artifacts/kdbnet/benchmarks/cp-easy/sdf
+  weights_dir: artifacts/kdbnet/weights/cp-easy
+  infer_if_weights_available: true
+  output_kind: logits
+  n_ensembles: 1
+  onthefly: false
+  contact_cutoff: 8.0
+  num_pos_emb: 16
+  num_rbf: 16
+
+  # Stage these KDBNet protein assets before training or inference.
+  # The runner writes artifacts/kdbnet/benchmarks/cp-easy/protein2pdb.template.yaml.
+  protein2pdb_path: artifacts/kdbnet/protein_assets/protein2pdb.yaml
+  pdb_json_path: artifacts/kdbnet/protein_assets/pockets_structure.json
+  esm_dir: artifacts/kdbnet/protein_assets/esm1b
+
+model:
+  prot_emb_dim: 1280
+  prot_gcn_dims:
+    - 128
+    - 256
+    - 256
+  prot_fc_dims:
+    - 1024
+    - 128
+  drug_node_in_dim:
+    - 66
+    - 1
+  drug_edge_in_dim:
+    - 16
+    - 1
+  drug_edge_h_dims:
+    - 32
+    - 1
+  drug_gcn_dims:
+    - 128
+    - 64
+  drug_fc_dims:
+    - 1024
+    - 128
+  mlp_dims:
+    - 1024
+    - 512
+  mlp_dropout: 0.25
+
+training:
+  epochs: 100
+  batch_size: 128
+  lr: 0.0005
+  weight_decay: 0.0
+  num_workers: 0
+  device: cuda
+  early_stopping_patience: 10
+  resume: false
+  max_train_batches: null
+
+output:
+  root_dir: runs/kdbnet
+  allow_rerun_suffix: true
+
+metrics:
+  primary: classification.auprc
+  threshold: 0.5
+  ks:
+    - 10
+    - 50
+    - 100
+  ef_fractions:
+    - 0.01
+    - 0.05

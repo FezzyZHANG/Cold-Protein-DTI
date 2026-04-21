@@ -18,7 +18,7 @@ RESULTS_RSYNC_FLAGS ?= -avz --progress
 RSYNC := rsync $(RESULTS_RSYNC_FLAGS)
 SSH := ssh $(SSH_HOST)
 
-.PHONY: help check-env mkdirs sync pull pull-results push-results clean-results-list bootstrap remote-smoke remote-train remote-eval logs remote-bash
+.PHONY: help check-env mkdirs sync pull pull-results push-results clean-results-list bootstrap remote-smoke remote-train remote-eval remote-kdbnet remote-scopedti logs remote-bash
 
 help:
 	@echo "Targets:"
@@ -33,6 +33,8 @@ help:
 	@echo "  make remote-smoke           # run remote smoke test"
 	@echo "  make remote-train EXP=...   # launch remote training"
 	@echo "  make remote-eval EXP=...    # launch remote evaluation"
+	@echo "  make remote-kdbnet EXP=...  # launch remote KDBNet benchmark"
+	@echo "  make remote-scopedti EXP=... # launch remote Scope-DTI benchmark"
 	@echo "  make logs                   # tail remote log"
 	@echo "  make remote-bash            # open a shell in remote project root"
 
@@ -79,6 +81,12 @@ remote-train:
 
 remote-eval:
 	$(SSH) 'cd $(REMOTE_ROOT) && mkdir -p logs && nohup bash scripts/remote_run.sh eval $(EXP) > logs/remote_eval.log 2>&1 & echo $$!'
+
+remote-kdbnet:
+	$(SSH) 'cd $(REMOTE_ROOT) && mkdir -p logs runs/kdbnet artifacts/kdbnet && nohup bash scripts/remote_run.sh kdbnet $(EXP) > logs/remote_kdbnet.log 2>&1 & echo $$!'
+
+remote-scopedti:
+	$(SSH) 'cd $(REMOTE_ROOT) && mkdir -p logs runs/scopedti artifacts/ScopeDTI && nohup bash scripts/remote_run.sh scopedti $(EXP) > logs/remote_scopedti.log 2>&1 & echo $$!'
 
 logs:
 	$(SSH) 'cd $(REMOTE_ROOT) && tail -n 200 -f $(REMOTE_LOG)'
