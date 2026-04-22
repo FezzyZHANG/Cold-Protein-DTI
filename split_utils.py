@@ -79,6 +79,79 @@ def _deterministic_subsample_rows(df: pl.DataFrame, n_rows: int, seed: int) -> p
     )
 
 
+def _downsample_extreme_ratio_by_group(
+    df: pl.DataFrame,
+    group_col: str,
+    max_extrame_ratio: float,
+    seed: int,
+) -> pl.DataFrame:
+    """Randomly drop majority-label rows within groups until both label ratios are below the threshold."""
+    if df.height == 0:
+        return df
+
+    stats = (
+        df.group_by(group_col)
+          .agg(
+              pl.len().alias("_n"),
+              pl.col("label").sum().cast(pl.Int64).alias("_n_pos"),
+          )
+          .with_columns((pl.col("_n") - pl.col("_n_pos")).alias("_n_neg"))
+    )
+
+    d = (
+        df.with_columns(pl.col("_row_id").hash(seed=seed).alias("_balance_ord"))
+          .sort([group_col, "label", "_balance_ord"])
+          .with_columns((pl.col("_row_id").cum_count().over([group_col, "label"]) - 1).alias("_class_rank"))
+          .join(stats, on=group_col, how="left")
+          .with_columns(
+              (pl.col("_n_neg") > pl.col("_n_pos")).alias("_neg_is_majority"),
+              (pl.col("_n_pos") > pl.col("_n_neg")).alias("_pos_is_majority"),
+              ((pl.col("_n_pos") * max_extrame_ratio).ceil().cast(pl.Int64) - 1).alias("_max_neg"),
+              ((pl.col("_n_neg") * max_extrame_ratio).ceil().cast(pl.Int64) - 1).alias("_max_pos"),
+          )
+          .with_columns(
+              pl.when((pl.col("_n_pos") == 0) | (pl.col("_n_neg") == 0))
+                .then(False)
+                .when(
+                    (pl.col("_n_pos") == pl.col("_n_neg"))
+                    & ((pl.col("_n_neg") / pl.col("_n_pos")) >= max_extrame_ratio)
+                    & ((pl.col("_n_pos") / pl.col("_n_neg")) >= max_extrame_ratio)
+                )
+                .then(False)
+                .when(
+                    (pl.col("label") == 0)
+                    & pl.col("_neg_is_majority")
+                    & ((pl.col("_n_neg") / pl.col("_n_pos")) >= max_extrame_ratio)
+                )
+                .then(pl.col("_class_rank") < pl.col("_max_neg"))
+                .when(
+                    (pl.col("label") == 1)
+                    & pl.col("_pos_is_majority")
+                    & ((pl.col("_n_pos") / pl.col("_n_neg")) >= max_extrame_ratio)
+                )
+                .then(pl.col("_class_rank") < pl.col("_max_pos"))
+                .otherwise(True)
+                .alias("_keep_balance")
+          )
+          .filter(pl.col("_keep_balance"))
+          .drop(
+              [
+                  "_balance_ord",
+                  "_class_rank",
+                  "_n",
+                  "_n_pos",
+                  "_n_neg",
+                  "_neg_is_majority",
+                  "_pos_is_majority",
+                  "_max_neg",
+                  "_max_pos",
+                  "_keep_balance",
+              ]
+          )
+    )
+    return d
+
+
 def _cosine_distance(a: list[float], b: list[float]) -> float:
     """Cosine distance in [0, 2] with NumPy acceleration."""
     a_np = np.asarray(a, dtype=np.float32)
@@ -293,7 +366,9 @@ def scopeDTI_chem_filter(
 
     Rules:
     1) keep entities with at least min DTIs (chem and protein)
-    2) keep entities with n_neg / n_pos < max_extrame_ratio (if provided)
+    2) if provided, try to satisfy label balance per chem/protein by randomly
+       dropping majority-label rows until both n_neg / n_pos and n_pos / n_neg
+       are below max_extrame_ratio
 
     Returns:
     - (filtered_table, dropped_table)
@@ -318,7 +393,7 @@ def scopeDTI_chem_filter(
     table0 = table.with_row_index("_row_id")
     current = table0
 
-    for _ in range(max_iters):
+    for iter_idx in range(max_iters):
         prev_height = current.height
 
         chem_s = (
@@ -330,12 +405,16 @@ def scopeDTI_chem_filter(
                    .with_columns((pl.col("_n") - pl.col("_n_pos")).alias("_n_neg"))
         )
         chem_keep_expr = pl.col("_n") >= min_dti_per_chem
-        if max_extrame_ratio is not None:
-            chem_keep_expr = chem_keep_expr & (pl.col("_n_pos") > 0) & (
-                (pl.col("_n_neg") / pl.col("_n_pos")) < max_extrame_ratio
-            )
         keep_chems = chem_s.filter(chem_keep_expr).select("inchi_key")
         current = current.join(keep_chems, on="inchi_key", how="inner")
+
+        if max_extrame_ratio is not None:
+            current = _downsample_extreme_ratio_by_group(
+                current,
+                group_col="inchi_key",
+                max_extrame_ratio=max_extrame_ratio,
+                seed=subsample_seed + iter_idx * 2,
+            )
 
         prot_s = (
             current.group_by("target_uniprot_id")
@@ -346,12 +425,16 @@ def scopeDTI_chem_filter(
                    .with_columns((pl.col("_n") - pl.col("_n_pos")).alias("_n_neg"))
         )
         prot_keep_expr = pl.col("_n") >= min_dti_per_protein
-        if max_extrame_ratio is not None:
-            prot_keep_expr = prot_keep_expr & (pl.col("_n_pos") > 0) & (
-                (pl.col("_n_neg") / pl.col("_n_pos")) < max_extrame_ratio
-            )
         keep_prots = prot_s.filter(prot_keep_expr).select("target_uniprot_id")
         current = current.join(keep_prots, on="target_uniprot_id", how="inner")
+
+        if max_extrame_ratio is not None:
+            current = _downsample_extreme_ratio_by_group(
+                current,
+                group_col="target_uniprot_id",
+                max_extrame_ratio=max_extrame_ratio,
+                seed=subsample_seed + iter_idx * 2 + 1,
+            )
 
         if current.height == prev_height:
             # print(f"Filtering converged after {_+1} iterations. Remaining rows: {current.height}")
@@ -552,17 +635,21 @@ def build_esm2_embedding_table(
     if pairs.filter(pl.col("sequence").str.len_chars() == 0).height > 0:
         raise ValueError("Empty sequence values found.")
 
+    # Lazy import to avoid hard dependency for users who only need splitting.
     try:
         torch = importlib.import_module("torch")
-        from src.model.esm_support import load_esm_backbone
+        esm = importlib.import_module("esm")
     except ImportError as e:
         raise ImportError(
-            "ESM-2 embedding requires `torch` plus the optional ESM dependencies. "
-            "Install them with `uv sync --extra esm`."
+            "ESM-2 embedding requires `torch` and `esm` packages. "
+            "Please install them in your environment."
         ) from e
 
-    loaded_backbone = load_esm_backbone(model_name=model_name)
-    model = loaded_backbone.backbone
+    load_fn = getattr(esm.pretrained, model_name, None)
+    if load_fn is None:
+        raise ValueError(f"Unknown ESM-2 model: {model_name}")
+
+    model, alphabet = load_fn()
     model.eval()
 
     if device is None:
@@ -570,18 +657,9 @@ def build_esm2_embedding_table(
     model = model.to(device)
 
     if repr_layer is None:
-        repr_layer = int(loaded_backbone.num_layers)
-    repr_layer = int(repr_layer)
-    if repr_layer < 0 or repr_layer > int(loaded_backbone.num_layers):
-        raise ValueError(
-            f"repr_layer must be between 0 and {loaded_backbone.num_layers} for {model_name}. "
-            f"Received {repr_layer}."
-        )
+        repr_layer = int(getattr(model, "num_layers", 33))
 
-    tokenizer = loaded_backbone.tokenizer
-    special_token_ids = set()
-    if tokenizer is not None:
-        special_token_ids = {int(token_id) for token_id in tokenizer.all_special_ids if token_id is not None}
+    batch_converter = alphabet.get_batch_converter()
 
     rows: list[dict[str, Any]] = []
     ids = pairs["target_uniprot_id"].to_list()
@@ -601,38 +679,18 @@ def build_esm2_embedding_table(
         end = min(start + batch_size, len(ids))
         batch_data = [(ids[i], seqs[i]) for i in range(start, end)]
 
-        batch_sequences = [sequence for _, sequence in batch_data]
-        encoded = tokenizer(
-            batch_sequences,
-            add_special_tokens=True,
-            padding=True,
-            truncation=True,
-            max_length=MAX_SEQ_LEN,
-            return_attention_mask=True,
-            return_tensors="pt",
-        )
-        batch_tokens = encoded["input_ids"].to(device)
-        attention_mask = encoded["attention_mask"].to(device)
-        use_hidden_states = repr_layer != int(loaded_backbone.num_layers)
+        _, _, batch_tokens = batch_converter(batch_data)
+        batch_tokens = batch_tokens.to(device)
+        batch_lens = (batch_tokens != alphabet.padding_idx).sum(1)
 
         with torch.no_grad():
-            out = model(
-                input_ids=batch_tokens,
-                attention_mask=attention_mask,
-                output_hidden_states=use_hidden_states,
-                return_dict=True,
-            )
-            if use_hidden_states:
-                token_reps = out.hidden_states[repr_layer]
-            else:
-                token_reps = out.last_hidden_state
-
-        residue_mask = attention_mask.to(dtype=torch.bool)
-        for token_id in special_token_ids:
-            residue_mask &= batch_tokens.ne(token_id)
+            out = model(batch_tokens, repr_layers=[repr_layer], return_contacts=False)
+            token_reps = out["representations"][repr_layer]
 
         for i, (pid, seq) in enumerate(batch_data):
-            residue_reps = token_reps[i][residue_mask[i]]
+            seq_len = int(batch_lens[i].item())
+            # Exclude BOS/EOS tokens.
+            residue_reps = token_reps[i, 1:seq_len - 1]
             emb = residue_reps.mean(0)
             if normalize:
                 emb = torch.nn.functional.normalize(emb, p=2, dim=0)
