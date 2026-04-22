@@ -638,72 +638,163 @@ def build_esm2_embedding_table(
     # Lazy import to avoid hard dependency for users who only need splitting.
     try:
         torch = importlib.import_module("torch")
-        esm = importlib.import_module("esm")
     except ImportError as e:
         raise ImportError(
-            "ESM-2 embedding requires `torch` and `esm` packages. "
-            "Please install them in your environment."
+            "ESM-2 embedding requires `torch`. Please install the ESM extra "
+            "with `uv sync --extra esm`."
         ) from e
 
-    load_fn = getattr(esm.pretrained, model_name, None)
-    if load_fn is None:
-        raise ValueError(f"Unknown ESM-2 model: {model_name}")
+    def _rows_from_huggingface_backbone() -> pl.DataFrame:
+        from src.model.esm_support import load_esm_backbone
 
-    model, alphabet = load_fn()
-    model.eval()
+        loaded = load_esm_backbone(model_name=model_name, prefer_staged_artifacts=True, backend="huggingface")
+        model = loaded.backbone.eval()
 
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = model.to(device)
+        resolved_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(resolved_device)
 
-    if repr_layer is None:
-        repr_layer = int(getattr(model, "num_layers", 33))
-
-    batch_converter = alphabet.get_batch_converter()
-
-    rows: list[dict[str, Any]] = []
-    ids = pairs["target_uniprot_id"].to_list()
-    seqs = pairs["sequence"].to_list()
-
-    seqs = [s if len(s) <= MAX_SEQ_LEN - 2 else s[:MAX_SEQ_LEN - 2] for s in seqs]
-
-    print(f"Computing ESM-2 embeddings for {len(ids)} proteins using model {model_name} on device {device}...")
-
-    try:
-        tqdm = importlib.import_module("tqdm")
-        iter_range = tqdm.tqdm(range(0, len(ids), batch_size), desc="Computing ESM-2 embeddings")
-    except ImportError:
-        iter_range = range(0, len(ids), batch_size)
-
-    for start in iter_range:
-        end = min(start + batch_size, len(ids))
-        batch_data = [(ids[i], seqs[i]) for i in range(start, end)]
-
-        _, _, batch_tokens = batch_converter(batch_data)
-        batch_tokens = batch_tokens.to(device)
-        batch_lens = (batch_tokens != alphabet.padding_idx).sum(1)
-
-        with torch.no_grad():
-            out = model(batch_tokens, repr_layers=[repr_layer], return_contacts=False)
-            token_reps = out["representations"][repr_layer]
-
-        for i, (pid, seq) in enumerate(batch_data):
-            seq_len = int(batch_lens[i].item())
-            # Exclude BOS/EOS tokens.
-            residue_reps = token_reps[i, 1:seq_len - 1]
-            emb = residue_reps.mean(0)
-            if normalize:
-                emb = torch.nn.functional.normalize(emb, p=2, dim=0)
-
-            rows.append(
-                {
-                    "target_uniprot_id": pid,
-                    "sequence": seq,
-                    "embedding": emb.detach().cpu().to(torch.float32).tolist(),
-                }
+        resolved_layer = int(loaded.num_layers if repr_layer is None else repr_layer)
+        if resolved_layer < 0 or resolved_layer > int(loaded.num_layers):
+            raise ValueError(
+                f"repr_layer must be between 0 and {loaded.num_layers} for {model_name}; got {resolved_layer}."
             )
 
-    return pl.DataFrame(rows)
+        rows: list[dict[str, Any]] = []
+        ids = pairs["target_uniprot_id"].to_list()
+        seqs = pairs["sequence"].to_list()
+
+        print(
+            "Computing ESM-2 embeddings for "
+            f"{len(ids)} proteins using staged model {model_name} on device {resolved_device}..."
+        )
+
+        try:
+            tqdm = importlib.import_module("tqdm")
+            iter_range = tqdm.tqdm(range(0, len(ids), batch_size), desc="Computing ESM-2 embeddings")
+        except ImportError:
+            iter_range = range(0, len(ids), batch_size)
+
+        tokenizer = loaded.tokenizer
+        for start in iter_range:
+            end = min(start + batch_size, len(ids))
+            batch_ids = ids[start:end]
+            batch_seqs = seqs[start:end]
+
+            encoded = tokenizer(
+                batch_seqs,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=MAX_SEQ_LEN,
+                return_special_tokens_mask=True,
+            )
+            input_ids = encoded["input_ids"].to(resolved_device)
+            attention_mask = encoded["attention_mask"].to(resolved_device)
+            special_tokens_mask = encoded["special_tokens_mask"].to(resolved_device).bool()
+
+            with torch.no_grad():
+                out = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+                token_reps = out.hidden_states[resolved_layer]
+
+            valid_mask = attention_mask.bool() & ~special_tokens_mask
+            for i, pid in enumerate(batch_ids):
+                residue_reps = token_reps[i][valid_mask[i]]
+                if residue_reps.shape[0] == 0:
+                    raise ValueError(f"Sequence for protein {pid} produced no residue tokens after tokenization.")
+                emb = residue_reps.mean(0)
+                if normalize:
+                    emb = torch.nn.functional.normalize(emb, p=2, dim=0)
+
+                rows.append(
+                    {
+                        "target_uniprot_id": pid,
+                        "sequence": batch_seqs[i],
+                        "embedding": emb.detach().cpu().to(torch.float32).tolist(),
+                    }
+                )
+
+        return pl.DataFrame(rows)
+
+    def _rows_from_fair_esm() -> pl.DataFrame:
+        try:
+            esm = importlib.import_module("esm")
+        except ImportError as e:
+            raise ImportError(
+                "ESM-2 embedding requires either staged Hugging Face ESM assets "
+                "or the legacy `fair-esm` package."
+            ) from e
+
+        pretrained = getattr(esm, "pretrained", None)
+        if pretrained is None:
+            raise AttributeError("The installed `esm` package does not provide `esm.pretrained`.")
+
+        load_fn = getattr(pretrained, model_name, None)
+        if load_fn is None:
+            raise ValueError(f"Unknown ESM-2 model for legacy fair-esm loader: {model_name}")
+
+        model, alphabet = load_fn()
+        model.eval()
+
+        resolved_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(resolved_device)
+
+        resolved_layer = int(getattr(model, "num_layers", 33) if repr_layer is None else repr_layer)
+        batch_converter = alphabet.get_batch_converter()
+
+        rows: list[dict[str, Any]] = []
+        ids = pairs["target_uniprot_id"].to_list()
+        seqs = pairs["sequence"].to_list()
+        seqs = [s if len(s) <= MAX_SEQ_LEN - 2 else s[:MAX_SEQ_LEN - 2] for s in seqs]
+
+        print(f"Computing ESM-2 embeddings for {len(ids)} proteins using model {model_name} on device {resolved_device}...")
+
+        try:
+            tqdm = importlib.import_module("tqdm")
+            iter_range = tqdm.tqdm(range(0, len(ids), batch_size), desc="Computing ESM-2 embeddings")
+        except ImportError:
+            iter_range = range(0, len(ids), batch_size)
+
+        for start in iter_range:
+            end = min(start + batch_size, len(ids))
+            batch_data = [(ids[i], seqs[i]) for i in range(start, end)]
+
+            _, _, batch_tokens = batch_converter(batch_data)
+            batch_tokens = batch_tokens.to(resolved_device)
+            batch_lens = (batch_tokens != alphabet.padding_idx).sum(1)
+
+            with torch.no_grad():
+                out = model(batch_tokens, repr_layers=[resolved_layer], return_contacts=False)
+                token_reps = out["representations"][resolved_layer]
+
+            for i, (pid, seq) in enumerate(batch_data):
+                seq_len = int(batch_lens[i].item())
+                # Exclude BOS/EOS tokens.
+                residue_reps = token_reps[i, 1:seq_len - 1]
+                emb = residue_reps.mean(0)
+                if normalize:
+                    emb = torch.nn.functional.normalize(emb, p=2, dim=0)
+
+                rows.append(
+                    {
+                        "target_uniprot_id": pid,
+                        "sequence": seq,
+                        "embedding": emb.detach().cpu().to(torch.float32).tolist(),
+                    }
+                )
+
+        return pl.DataFrame(rows)
+
+    try:
+        return _rows_from_huggingface_backbone()
+    except (FileNotFoundError, RuntimeError, ImportError, ValueError) as hf_exc:
+        try:
+            return _rows_from_fair_esm()
+        except (ImportError, AttributeError, ValueError) as fair_exc:
+            raise RuntimeError(
+                "Unable to load ESM-2 embeddings. Tried the staged Hugging Face artifact loader "
+                f"for `{model_name}` and the legacy fair-esm `esm.pretrained` loader. "
+                f"Staged-loader error: {hf_exc}. Legacy-loader error: {fair_exc}."
+            ) from fair_exc
 
 
 def split_dataset(
