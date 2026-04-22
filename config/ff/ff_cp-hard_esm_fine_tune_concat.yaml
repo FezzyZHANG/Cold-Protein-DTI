@@ -1,17 +1,17 @@
-run_name: ff_cp-easy_cnn_concat
+run_name: ff_exprS1_cp-hard_esm_fine_tune_concat_s42_sub100000
 seed: -1
 
 data:
   dataset_name: scope_dti
-  split_name: cp-easy
-  split_dir: data/splits/cp-easy_sub100000
+  split_name: cp-hard
+  split_dir: data/splits/cp-hard_sub100000
   raw_path: data/scope_dti_with_inchikey.parquet
-  graph_cache_path: data/splits/cp-easy_sub100000/graph_cache.pt
+  graph_cache_path: data/splits/cp-hard_sub100000/graph_cache.pt
   max_protein_length: 1022
 
 model:
   hidden_dim: 256
-  dropout: 0.01
+  dropout: 0.1
   drug_encoder:
     name: gvp
     node_hidden_scalar: 256
@@ -19,26 +19,26 @@ model:
     edge_hidden_scalar: 64
     edge_hidden_vector: 4
     num_layers: 3
-    dropout: 0.01
+    dropout: 0.1
   protein_encoder:
-    name: cnn
-    mode: scratch
-    embed_dim: 128
+    name: esm
+    mode: finetuned
     hidden_dim: 256
-    kernel_sizes:
-      - 5
-      - 9
-      - 15
     dropout: 0.01
+    model_name: esm2_t33_650M_UR50D
+    local_checkpoint_path: artifacts/pretrained/esm2_t33_650M_UR50D
+    repr_layer: null
+    freeze_n_layers: 0
+    max_input_length: 1022
   fusion:
     name: concat
     hidden_dim: 256
-    dropout: 0.01
+    dropout: 0.1
 
 training:
-  epochs: 200
-  batch_size: 128
-  lr: 0.001
+  epochs: 60
+  batch_size: 4
+  lr: 0.0001
   weight_decay: 0.00001
   amp: true
   num_workers: 0
