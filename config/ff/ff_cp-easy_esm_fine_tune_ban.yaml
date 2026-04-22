@@ -60,7 +60,7 @@ training:
 
 output:
   root_dir: results
-  save_checkpoints: true
+  save_checkpoints: false
   save_every_n_epochs: 1
   allow_rerun_suffix: true
 
