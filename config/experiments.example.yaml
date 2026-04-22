@@ -34,6 +34,7 @@ model:
     name: concat
     hidden_dim: 256
     dropout: 0.1
+    input_norm: layernorm
 
 training:
   epochs: 5

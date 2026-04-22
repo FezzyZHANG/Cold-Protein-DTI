@@ -57,7 +57,7 @@ def _canonicalize_norm_kind(kind: str | None) -> str:
 
 
 def _make_feature_norm(dim: int, kind: str) -> nn.Module:
-    """Create a conservative feature normalization layer for rank-2 activations."""
+    """Create a conservative feature normalization layer for feature activations."""
 
     normalized_kind = _canonicalize_norm_kind(kind)
     if normalized_kind == "batchnorm":
@@ -74,6 +74,56 @@ def _reset_feature_norm(module: nn.Module) -> None:
         init_batch_norm(module)
     elif isinstance(module, nn.LayerNorm):
         init_layer_norm(module)
+
+
+class FeatureInputNorm(nn.Module):
+    """Normalize encoder features immediately before cross-modal fusion."""
+
+    def __init__(self, dim: int, kind: str) -> None:
+        super().__init__()
+        self.norm = _make_feature_norm(dim, kind)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        _reset_feature_norm(self.norm)
+
+    def forward(self, features: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        if isinstance(self.norm, nn.BatchNorm1d) and features.ndim == 3:
+            normalized = self.norm(features.reshape(-1, features.size(-1))).reshape_as(features)
+        else:
+            normalized = self.norm(features)
+
+        if mask is None:
+            return normalized
+
+        mask = mask.to(device=normalized.device, dtype=torch.bool)
+        if normalized.ndim == 2:
+            if mask.ndim != 1 or mask.shape[0] != normalized.shape[0]:
+                raise ValueError(
+                    "Rank-2 feature normalization masks must have shape (batch,). "
+                    f"Received mask shape {tuple(mask.shape)} for features {tuple(normalized.shape)}."
+                )
+            return normalized * mask.unsqueeze(-1).to(normalized.dtype)
+
+        if normalized.ndim == 3:
+            if mask.ndim != 2 or mask.shape != normalized.shape[:2]:
+                raise ValueError(
+                    "Rank-3 feature normalization masks must have shape (batch, length). "
+                    f"Received mask shape {tuple(mask.shape)} for features {tuple(normalized.shape)}."
+                )
+            return normalized * mask.unsqueeze(-1).to(normalized.dtype)
+
+        raise ValueError(f"FeatureInputNorm expects rank-2 or rank-3 features. Received {tuple(normalized.shape)}.")
+
+
+def _nonempty_rows(output: dict[str, torch.Tensor], name: str) -> torch.Tensor | None:
+    """Return which batch rows contain at least one valid token, when a mask is available."""
+
+    mask = output.get("mask")
+    if mask is None:
+        return None
+    mask = _require_rank(mask, 2, f"{name} mask").to(dtype=torch.bool)
+    return mask.any(dim=1)
 
 
 def _disabled_autocast_context(device_type: str) -> torch.amp.autocast_mode.autocast | nullcontext:
@@ -331,8 +381,17 @@ class MLPDecoder(nn.Module):
 class ConcatFusion(nn.Module):
     """Baseline concatenation + MLP fusion head."""
 
-    def __init__(self, drug_input_dim: int, protein_input_dim: int, hidden_dim: int, dropout: float) -> None:
+    def __init__(
+        self,
+        drug_input_dim: int,
+        protein_input_dim: int,
+        hidden_dim: int,
+        dropout: float,
+        input_norm: str = "layernorm",
+    ) -> None:
         super().__init__()
+        self.drug_input_norm = FeatureInputNorm(int(drug_input_dim), input_norm)
+        self.protein_input_norm = FeatureInputNorm(int(protein_input_dim), input_norm)
         self.classifier = nn.Sequential(
             nn.Linear(int(drug_input_dim) + int(protein_input_dim), hidden_dim),
             nn.GELU(),
@@ -343,6 +402,8 @@ class ConcatFusion(nn.Module):
 
     def reset_parameters(self) -> None:
         gelu_gain = activation_gain("gelu")
+        self.drug_input_norm.reset_parameters()
+        self.protein_input_norm.reset_parameters()
         init_linear(self.classifier[0], gain=gelu_gain)
         init_linear(self.classifier[3])
 
@@ -350,12 +411,16 @@ class ConcatFusion(nn.Module):
         drug_pooled = _pooled_features(drug_output, "drug")
         protein_pooled = _pooled_features(protein_output, "protein")
         drug_pooled, protein_pooled = _promote_pair_dtype(drug_pooled, protein_pooled)
+        drug_nonempty = _nonempty_rows(drug_output, "drug")
+        protein_nonempty = _nonempty_rows(protein_output, "protein")
         if drug_pooled.size(0) != protein_pooled.size(0):
             raise ValueError(
                 "Drug and protein pooled features must share the same batch size. "
                 f"Received {drug_pooled.size(0)} and {protein_pooled.size(0)}."
             )
 
+        drug_pooled = self.drug_input_norm(drug_pooled, drug_nonempty)
+        protein_pooled = self.protein_input_norm(protein_pooled, protein_nonempty)
         fused = torch.cat([drug_pooled, protein_pooled], dim=-1)
         return self.classifier(fused).squeeze(-1)
 
@@ -376,6 +441,7 @@ class BANFusion(nn.Module):
         use_global_features: bool = True,
         attention_softmax: bool = True,
         norm: str = "layernorm",
+        input_norm: str = "layernorm",
         classifier_num_blocks: int = 2,
         classifier_expansion: float = 2.0,
     ) -> None:
@@ -392,6 +458,8 @@ class BANFusion(nn.Module):
         self.attention_softmax = bool(attention_softmax)
         self.joint_dim = int(joint_dim)
         self.last_attention_maps: torch.Tensor | None = None
+        self.drug_input_norm = FeatureInputNorm(self.drug_input_dim, input_norm)
+        self.protein_input_norm = FeatureInputNorm(self.protein_input_dim, input_norm)
 
         ban = BANLayer(
             v_dim=self.drug_input_dim,
@@ -432,7 +500,11 @@ class BANFusion(nn.Module):
         if mode == "pooled":
             pooled = _pooled_features(output, name)
             pooled = _require_rank(pooled, 2, f"{name} pooled")
-            mask = torch.ones(pooled.size(0), 1, dtype=torch.bool, device=pooled.device)
+            nonempty = _nonempty_rows(output, name)
+            if nonempty is None:
+                mask = torch.ones(pooled.size(0), 1, dtype=torch.bool, device=pooled.device)
+            else:
+                mask = nonempty.to(device=pooled.device).unsqueeze(1)
             return pooled.unsqueeze(1), mask
 
         token_features = _require_rank(output["token_features"], 3, f"{name} token_features")
@@ -466,6 +538,8 @@ class BANFusion(nn.Module):
     def forward(self, drug_output: dict[str, torch.Tensor], protein_output: dict[str, torch.Tensor]) -> torch.Tensor:
         drug_global = _pooled_features(drug_output, "drug")
         protein_global = _pooled_features(protein_output, "protein")
+        drug_nonempty = _nonempty_rows(drug_output, "drug")
+        protein_nonempty = _nonempty_rows(protein_output, "protein")
         drug_features, drug_mask = self._select_sequence_features(
             drug_output,
             name="drug",
@@ -495,6 +569,11 @@ class BANFusion(nn.Module):
                 "Protein feature width does not match the BAN input dimension. "
                 f"Expected {self.protein_input_dim}, received {protein_features.size(2)}."
             )
+
+        drug_features = self.drug_input_norm(drug_features, drug_mask)
+        protein_features = self.protein_input_norm(protein_features, protein_mask)
+        drug_global = self.drug_input_norm(drug_global, drug_nonempty)
+        protein_global = self.protein_input_norm(protein_global, protein_nonempty)
 
         drug_features, drug_mask = self._ensure_nonempty_sequence(drug_features, drug_mask, drug_global)
         protein_features, protein_mask = self._ensure_nonempty_sequence(protein_features, protein_mask, protein_global)

@@ -357,6 +357,12 @@ def _normalize_model_config(model_cfg: dict[str, Any]) -> dict[str, Any]:
     fusion_cfg.setdefault("dropout", normalized.get("dropout", 0.1))
     if fusion_cfg["name"] not in {"concat", "ban"}:
         raise ConfigError("Fusion head must be one of: concat, ban.")
+
+    fusion_cfg.setdefault("input_norm", "layernorm")
+    fusion_cfg["input_norm"] = str(fusion_cfg["input_norm"]).lower().replace("_", "").replace("-", "")
+    if fusion_cfg["input_norm"] not in {"batchnorm", "bn", "layernorm", "ln", "none", "identity"}:
+        raise ConfigError("model.fusion.input_norm must be one of: batchnorm, layernorm, none.")
+
     if fusion_cfg["name"] == "ban":
         fusion_cfg.setdefault("joint_dim", normalized.get("hidden_dim", 256))
         fusion_cfg.setdefault("classifier_hidden_dim", fusion_cfg["hidden_dim"])

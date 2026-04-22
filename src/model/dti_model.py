@@ -99,6 +99,7 @@ def build_model(config: dict[str, object]) -> DTIModel:
             protein_input_dim=int(protein_encoder.output_dim),
             hidden_dim=int(fusion_cfg["hidden_dim"]),
             dropout=float(fusion_cfg["dropout"]),
+            input_norm=str(fusion_cfg["input_norm"]),
         )
     else:
         fusion_head = BANFusion(
@@ -113,6 +114,7 @@ def build_model(config: dict[str, object]) -> DTIModel:
             use_global_features=bool(fusion_cfg["use_global_features"]),
             attention_softmax=bool(fusion_cfg["attention_softmax"]),
             norm=str(fusion_cfg["norm"]),
+            input_norm=str(fusion_cfg["input_norm"]),
             classifier_num_blocks=int(fusion_cfg["classifier_num_blocks"]),
             classifier_expansion=float(fusion_cfg["classifier_expansion"]),
         )
